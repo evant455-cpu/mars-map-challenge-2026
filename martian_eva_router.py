@@ -1,20 +1,19 @@
-"""Martian EVA Route Planning Engine for Gale Crater (Mount Sharp / Gediz Vallis).
+"""Martian EVA Route Planning Engine (Consumes Precomputed Hazard Layers).
 
-This module implements a terrain-aware 8-connected A* pathfinding and hazard-modeling
-engine for astronaut Extravehicular Activity (EVA) planning in the Mount Sharp
-Boxwork and Gediz Vallis corridor.
+Reads `hazard_layers.npz` produced by `terrain_hazard_mapper.py` as its single
+source of truth for elevation (`dem`), hazard tiers (`hazard_tier`), traversal
+penalties (`cost_multiplier`), and impassable obstacles (`no_go_mask`).
 
-Data & Scale Disclaimer:
-    - Real-terrain mode ingests 1.0 m/pixel HiRISE Digital Terrain Model (DTM)
-      GeoTIFF rasters (PDS 'DTEEC_*' products). Exact stereo DTM product IDs
-      covering the Mount Sharp boxwork and Gediz Vallis must be verified in the
-      University of Arizona HiRISE DTM catalog prior to operational runs.
-    - Standalone demonstration mode generates a clearly labeled SYNTHETIC LAYOUT
-      (~250 m synthetic separation between boxwork and Gediz Vallis) for
-      algorithmic verification only.
+Pathfinding Rules:
+    1. All cell-level hazard classifications, rock protrusion detections, and
+       edge-cell policies are inherited directly from `hazard_layers.npz`.
+    2. Retains a directional step-by-step slope check (`arctan2(|dz|, dist)`)
+       between adjacent cells so no single step exceeds `max_passable_slope_deg`.
+    3. Caches solved `(start, goal)` legs so walkback contingency checks reuse
+       already-computed return legs without duplicate A* runs.
 
 Example:
-    Run standalone with the synthetic Mount Sharp layout:
+    First run `terrain_hazard_mapper.py` to generate `hazard_layers.npz`, then:
         $ python3 martian_eva_router.py
 """
 
@@ -24,18 +23,11 @@ import json
 import logging
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 
-# Optional GIS and plotting dependencies; engine degrades gracefully if absent.
 try:
-    import rasterio
-    HAS_RASTERIO = True
-except ImportError:
-    HAS_RASTERIO = False
-
-
-try:
+    from matplotlib.colors import BoundaryNorm, ListedColormap
     import matplotlib.pyplot as plt
     HAS_MATPLOTLIB = True
 except ImportError:
@@ -48,9 +40,6 @@ except ImportError:
 def setup_logger(log_file: str = "eva_router.log", level: int = logging.INFO) -> logging.Logger:
     """Configures a dual-output logger for terminal and mobile log inspection.
 
-    Formats log lines with compact timestamps, severity levels, function names,
-    and line numbers so failures can be diagnosed quickly on a mobile SSH view.
-
     Args:
         log_file: Destination path for persistent execution logs.
         level: Logging threshold (e.g., logging.INFO, logging.DEBUG).
@@ -61,7 +50,6 @@ def setup_logger(log_file: str = "eva_router.log", level: int = logging.INFO) ->
     logger = logging.getLogger("MartianEVARouter")
     logger.setLevel(level)
 
-    # Avoid attaching duplicate handlers if module is re-imported
     if logger.handlers:
         return logger
 
@@ -92,54 +80,158 @@ MARS_GRAVITY_MPS2: float = 3.721  # Mars surface gravitational acceleration (m/s
 
 @dataclass
 class EVACostConfig:
-    """Biomechanical and safety constraints for an astronaut surface EVA.
+    """Biomechanical and mission contingency parameters for the route solver.
 
     Note:
-        All physiological and suit parameters below are baseline mission
-        planning assumptions and must be documented as such in mission reports.
+        Cell-level terrain hazards are governed by `hazard_layers.npz`. The
+        parameters below control adjacent-step slope limits, metabolic energy,
+        walking speed integration, and suit walkback limits.
 
     Attributes:
-        resolution_m: Spatial resolution of the elevation grid in meters/pixel.
-        astronaut_total_mass_kg: [ASSUMPTION] Suited astronaut mass (82 kg crew +
-            98 kg next-gen Mars EVA suit = 180 kg).
-        max_passable_slope_deg: [ASSUMPTION] Hard slope cutoff (deg); cells or
-            pixel transitions steeper than this are blocked as cliff/scarp hazards.
-        caution_slope_deg: [ASSUMPTION] Slope threshold (deg) above which an
-            extra steep-grade penalty discourages A* from using near-limit slopes.
-        max_roughness_m: [ASSUMPTION] Hard 3x3 Terrain Ruggedness Index (TRI)
-            cutoff in meters representing severe boulder/step trip hazards.
+        astronaut_total_mass_kg: [ASSUMPTION] Suited astronaut mass (180 kg).
+        max_passable_slope_deg: [ASSUMPTION] Maximum allowable step-to-step
+            slope transition (deg) between adjacent cells. If None, inherits
+            `no_go_slope_deg` from `hazard_layers.npz`.
         nominal_walk_speed_mps: [ASSUMPTION] Flat-ground suited walking speed (m/s).
         max_walkback_distance_m: [ASSUMPTION] Maximum safe return path distance (m)
-            from any point on the EVA back to the HAB/Lander under suit contingency.
-        slope_penalty_weight: [ASSUMPTION] Nonlinear cost weight penalizing steep
-            ridge climbs so A* prefers winding through flat sandy hollows.
-        roughness_penalty_weight: [ASSUMPTION] Cost weight penalizing uneven ground.
-        despike_hirise_seams: If True, applies a 3x3 median filter to suppress
-            ~0.5-1.0 m rectangular stereo correlation seam artifacts found in
-            some HiRISE DTMs.
+            from any science stop back to the HAB/Lander under suit contingency.
+        uphill_climb_weight: [ASSUMPTION] Extra routing cost weight per meter of
+            positive vertical climb (`dz > 0`).
     """
-    resolution_m: float = 1.0
     astronaut_total_mass_kg: float = 180.0
-    max_passable_slope_deg: float = 22.0
-    caution_slope_deg: float = 15.0
-    max_roughness_m: float = 0.85
+    max_passable_slope_deg: Optional[float] = None
     nominal_walk_speed_mps: float = 0.85
     max_walkback_distance_m: float = 1500.0
-    slope_penalty_weight: float = 4.5
-    roughness_penalty_weight: float = 4.0
-    despike_hirise_seams: bool = False
+    uphill_climb_weight: float = 1.6
+
+
+@dataclass
+class PrecomputedHazardSurface:
+    """In-memory representation of the precomputed layers from `hazard_layers.npz`.
+
+    Attributes:
+        dem: 2D float64 elevation array (meters).
+        slope_deg: 2D float64 terrain slope array (degrees).
+        roughness_tri_m: 2D float64 3x3 Terrain Ruggedness Index array (meters).
+        rock_protrusion_index_m: 2D float64 Rock Protrusion Index array (meters).
+        hazard_tier: 2D uint8 array {0: Nominal, 1: Caution, 2: High-Cost, 3: No-Go}.
+        cost_multiplier: 2D float64 traversal cost multiplier (>= 1.0, `np.inf` = No-Go).
+        no_go_mask: 2D boolean mask (True = impassable).
+        resolution_m: Pixel spacing in meters.
+        no_go_slope_deg: Hard slope cutoff (deg) recorded by the mapper.
+        geo_origin_xy: Top-left (Easting, Northing) map coordinate in meters.
+        is_synthetic_layout: True if derived from the synthetic test generator.
+        source_label: Dataset or synthetic layout identifier.
+        crs_wkt: Coordinate Reference System string.
+    """
+    dem: np.ndarray
+    slope_deg: np.ndarray
+    roughness_tri_m: np.ndarray
+    rock_protrusion_index_m: np.ndarray
+    hazard_tier: np.ndarray
+    cost_multiplier: np.ndarray
+    no_go_mask: np.ndarray
+    resolution_m: float
+    no_go_slope_deg: float
+    geo_origin_xy: Tuple[float, float]
+    is_synthetic_layout: bool
+    source_label: str
+    crs_wkt: str
+
+    @property
+    def rows(self) -> int:
+        """Grid row count (Y-axis)."""
+        return int(self.dem.shape[0])
+
+    @property
+    def cols(self) -> int:
+        """Grid column count (X-axis)."""
+        return int(self.dem.shape[1])
+
+    def pixel_to_map_xy(self, row: int, col: int) -> Tuple[float, float]:
+        """Converts grid (row, col) indices into geospatial (Easting, Northing) meters."""
+        x_m = self.geo_origin_xy[0] + col * self.resolution_m
+        y_m = self.geo_origin_xy[1] - row * self.resolution_m
+        return float(x_m), float(y_m)
+
+    @classmethod
+    def from_npz(cls, npz_path: str = "hazard_layers.npz") -> "PrecomputedHazardSurface":
+        """Loads `hazard_layers.npz` generated by `terrain_hazard_mapper.py`.
+
+        Args:
+            npz_path: Path to the compressed NumPy archive.
+
+        Returns:
+            Initialized PrecomputedHazardSurface instance.
+
+        Raises:
+            FileNotFoundError: If `npz_path` does not exist yet.
+        """
+        path = Path(npz_path)
+        if not path.exists():
+            msg = (
+                f"Precomputed hazard file '{npz_path}' not found. "
+                "Run `python3 terrain_hazard_mapper.py` first to generate it."
+            )
+            logger.error(msg)
+            raise FileNotFoundError(msg)
+
+        logger.info("Loading single-source-of-truth hazard layers from %s", npz_path)
+        with np.load(path, allow_pickle=False) as data:
+            protrusion_key = (
+                "rock_protrusion_index_m"
+                if "rock_protrusion_index_m" in data
+                else "rock_protrusion_m"
+            )
+            resolution_m = float(data["resolution_m"][0])
+            no_go_slope = (
+                float(data["no_go_slope_deg"][0]) if "no_go_slope_deg" in data else 22.0
+            )
+            origin_arr = data["geo_origin_xy"]
+            geo_origin_xy = (float(origin_arr[0]), float(origin_arr[1]))
+            is_synthetic = (
+                bool(data["is_synthetic_layout"][0])
+                if "is_synthetic_layout" in data
+                else True
+            )
+            source_label = (
+                str(data["source_label"][0])
+                if "source_label" in data
+                else "UNKNOWN_HAZARD_ARCHIVE"
+            )
+            crs_wkt = str(data["crs_wkt"][0]) if "crs_wkt" in data else "LOCAL_MARS_METRIC"
+
+            surface = cls(
+                dem=data["dem"].astype(np.float64),
+                slope_deg=data["slope_deg"].astype(np.float64),
+                roughness_tri_m=data["roughness_tri_m"].astype(np.float64),
+                rock_protrusion_index_m=data[protrusion_key].astype(np.float64),
+                hazard_tier=data["hazard_tier"].astype(np.uint8),
+                cost_multiplier=data["cost_multiplier"].astype(np.float64),
+                no_go_mask=data["no_go_mask"].astype(bool),
+                resolution_m=resolution_m,
+                no_go_slope_deg=no_go_slope,
+                geo_origin_xy=geo_origin_xy,
+                is_synthetic_layout=is_synthetic,
+                source_label=source_label,
+                crs_wkt=crs_wkt,
+            )
+
+        logger.info(
+            "Hazard surface loaded [%s] | SyntheticLayout=%s | Grid=%dx%d px (%.2f m/px) | No-Go=%.1f%%",
+            surface.source_label,
+            surface.is_synthetic_layout,
+            surface.rows,
+            surface.cols,
+            surface.resolution_m,
+            100.0 * float(np.mean(surface.no_go_mask)),
+        )
+        return surface
 
 
 @dataclass
 class Waypoint:
-    """Represents a named mission coordinate on the DEM grid.
-
-    Attributes:
-        name: Human-readable target identifier (e.g., 'Boxwork Vein Node').
-        row: Grid row index (Y-axis).
-        col: Grid column index (X-axis).
-        science_priority: Mission priority tag ('BASE', 'PRIMARY', 'ANOMALY').
-    """
+    """Represents a named mission coordinate on the DEM grid."""
     name: str
     row: int
     col: int
@@ -151,28 +243,10 @@ class LegTelemetry:
     """Computed engineering and safety metrics for a single traverse leg.
 
     Note on Metabolic Energy Model:
-        `estimated_energy_kj` uses a first-order mechanical work model combining
-        horizontal suited locomotion (~2.8 J/kg/m) and positive gravitational
-        climb work (`m * g_mars * max(0, dz) / 0.25` muscle efficiency). Downhill
-        segments (`dz < 0`) contribute zero gravitational climb work, making
-        return legs lower energy than outbound climbs. In real pressurized suits,
-        eccentric braking on steep descents adds moderate metabolic effort.
-
-    Attributes:
-        start_name: Origin waypoint name.
-        end_name: Destination waypoint name.
-        path_coords: Ordered list of (row, col) grid coordinates.
-        distance_m: Total 3D surface path length in meters.
-        elevation_gain_m: Cumulative positive vertical climb in meters.
-        elevation_loss_m: Cumulative vertical descent in meters.
-        max_slope_deg: Steepest single pixel transition encountered on the leg.
-        mean_slope_deg: Distance-weighted average slope along the leg.
-        steps_over_15deg: Count of grid steps exceeding 15.0 degrees.
-        steps_over_20deg: Count of grid steps exceeding 20.0 degrees (ridge gaps).
-        steep_distance_over_20deg_m: Total path distance (m) spent above 20.0 deg.
-        mean_roughness_m: Average Terrain Ruggedness Index along the leg.
-        estimated_energy_kj: Estimated astronaut metabolic energy expenditure (kJ).
-        estimated_duration_min: Step-by-step integrated traverse duration (minutes).
+        `estimated_energy_kj` combines horizontal suited locomotion (~2.8 J/kg/m)
+        and positive gravitational climb work (`m * g_mars * max(0, dz) / 0.25`).
+        Downhill segments (`dz < 0`) contribute zero positive climb work in this
+        baseline model, making return legs lower energy than outbound climbs.
     """
     start_name: str
     end_name: str
@@ -191,287 +265,10 @@ class LegTelemetry:
 
 
 # ==============================================================================
-# TERRAIN INGESTION & HAZARD ANALYSIS
-# ==============================================================================
-class TerrainAnalyzer:
-    """Loads elevation rasters and derives slope, roughness, and hazard masks."""
-
-    def __init__(
-        self,
-        dem: np.ndarray,
-        config: EVACostConfig,
-        is_synthetic: bool = False,
-        source_label: str = "UNVERIFIED_HIRISE_DTM",
-        geo_origin_xy: Tuple[float, float] = (0.0, 0.0),
-        crs_wkt: str = "LOCAL_MARS_METRIC",
-        raster_transform: Optional[Any] = None,
-    ) -> None:
-        """Initializes the analyzer with a 2D elevation array and spatial metadata.
-
-        Args:
-            dem: 2D NumPy float array of surface elevations in meters.
-            config: EVACostConfig containing spatial resolution and thresholds.
-            is_synthetic: Flag explicitly marking whether the DEM is synthetic.
-            source_label: Human-readable dataset identifier for logs/exports.
-            geo_origin_xy: (Easting, Northing) origin in meters for local projection.
-            crs_wkt: Coordinate Reference System string or WKT from GeoTIFF.
-            raster_transform: Optional rasterio Affine transform for exact mapping.
-
-        Raises:
-            ValueError: If the DEM is not a valid non-empty 2D array.
-        """
-        if dem.ndim != 2 or dem.size == 0:
-            logger.error("Invalid DEM dimensions: shape=%s", getattr(dem, "shape", None))
-            raise ValueError("DEM must be a non-empty 2D NumPy array.")
-
-        self.config: EVACostConfig = config
-        self.is_synthetic: bool = is_synthetic
-        self.source_label: str = source_label
-        self.geo_origin_xy: Tuple[float, float] = geo_origin_xy
-        self.crs_wkt: str = crs_wkt
-        self.raster_transform: Optional[Any] = raster_transform
-
-        raw_dem = dem.astype(np.float64)
-        self.rows, self.cols = raw_dem.shape
-
-        # Optional 3x3 median filter to suppress HiRISE stereo correlation patch seams
-        if self.config.despike_hirise_seams:
-            logger.info("Applying 3x3 median despike filter for HiRISE stereo patch seams.")
-            self.dem = self._median_filter_3x3(raw_dem)
-        else:
-            self.dem = raw_dem
-
-        logger.info(
-            "TerrainAnalyzer ready [%s] | SyntheticLayout=%s | Grid: %dx%d px (%.2f m/px) | Elev: %.2f to %.2f m",
-            self.source_label,
-            self.is_synthetic,
-            self.rows,
-            self.cols,
-            self.config.resolution_m,
-            float(np.nanmin(self.dem)),
-            float(np.nanmax(self.dem)),
-        )
-
-        self.slope_deg: np.ndarray = self._compute_slope_deg()
-        self.roughness_m: np.ndarray = self._compute_roughness_tri()
-        self.impassable_mask: np.ndarray = self._build_impassable_mask()
-
-    def pixel_to_map_xy(self, row: int, col: int) -> Tuple[float, float]:
-        """Converts grid (row, col) indices into geospatial (X, Y) coordinates.
-
-        Args:
-            row: Grid row index (Y-axis).
-            col: Grid column index (X-axis).
-
-        Returns:
-            Tuple of (X_easting, Y_northing) coordinates in map units (meters).
-        """
-        if HAS_RASTERIO and self.raster_transform is not None:
-            x_geo, y_geo = rasterio.transform.xy(self.raster_transform, row, col)
-            return float(x_geo), float(y_geo)
-
-        x_m = self.geo_origin_xy[0] + col * self.config.resolution_m
-        y_m = self.geo_origin_xy[1] - row * self.config.resolution_m
-        return float(x_m), float(y_m)
-
-    @classmethod
-    def from_geotiff(cls, filepath: str, config: EVACostConfig) -> "TerrainAnalyzer":
-        """Loads a HiRISE DTM GeoTIFF raster (e.g., PDS 'DTEEC_*' product) from disk.
-
-        Args:
-            filepath: Path to the GeoTIFF elevation raster.
-            config: EVACostConfig instance.
-
-        Returns:
-            Initialized TerrainAnalyzer instance with real geospatial metadata.
-
-        Raises:
-            ImportError: If rasterio is not installed.
-            FileNotFoundError: If the GeoTIFF path does not exist.
-            ValueError: If raster vertical units appear non-metric.
-        """
-        if not HAS_RASTERIO:
-            logger.critical("Attempted GeoTIFF load without rasterio installed.")
-            raise ImportError("Install 'rasterio' to read HiRISE GeoTIFF files.")
-
-        path = Path(filepath)
-        if not path.exists():
-            logger.error("GeoTIFF file not found at path: %s", filepath)
-            raise FileNotFoundError(f"GeoTIFF not found: {filepath}")
-
-        logger.info("Reading HiRISE DTM GeoTIFF: %s", filepath)
-        with rasterio.open(path) as dataset:
-            dem = dataset.read(1).astype(np.float64)
-            if dataset.nodata is not None:
-                dem = np.where(dem == dataset.nodata, np.nan, dem)
-
-            # Verify linear units are meters (standard for HiRISE DTEEC DTMs)
-            units = dataset.units[0] if dataset.units else None
-            if units and units.lower() not in ("m", "meter", "meters", "metre", "metres"):
-                logger.error("Unsupported DTM vertical units: %s (expected meters)", units)
-                raise ValueError(f"DTM vertical units must be meters, got: {units}")
-
-            config.resolution_m = abs(float(dataset.transform.a))
-            crs_str = dataset.crs.to_string() if dataset.crs else "UNKNOWN_CRS"
-
-            return cls(
-                dem=dem,
-                config=config,
-                is_synthetic=False,
-                source_label=path.name,
-                crs_wkt=crs_str,
-                raster_transform=dataset.transform,
-            )
-
-    @classmethod
-    def from_synthetic_mount_sharp(
-        cls, rows: int = 350, cols: int = 450, config: Optional[EVACostConfig] = None
-    ) -> "TerrainAnalyzer":
-        """Generates a synthetic layout of the Boxwork + Gediz Vallis corridor.
-
-        Note:
-            This is a SYNTHETIC LAYOUT for route-engine verification only. On
-            this synthetic grid, the boxwork zone and Gediz Vallis rim sit ~250 m
-            apart; actual separation must be measured from a verified HiRISE DTM.
-
-        Args:
-            rows: Grid height in meters (pixels).
-            cols: Grid width in meters (pixels).
-            config: Optional EVACostConfig; defaults to 1.0 m/px standard config.
-
-        Returns:
-            Initialized TerrainAnalyzer explicitly marked `is_synthetic=True`.
-        """
-        cfg = config or EVACostConfig(resolution_m=1.0)
-        logger.info(
-            "Generating SYNTHETIC LAYOUT (Mount Sharp Boxwork + Gediz Vallis, %dx%d)...",
-            rows,
-            cols,
-        )
-
-        rng = np.random.default_rng(seed=42)
-        y, x = np.mgrid[0:rows, 0:cols].astype(np.float64)
-
-        # 1. Gentle regional slope rising toward the south (Mount Sharp flank)
-        dem = 0.06 * y
-
-        # 2. Fractured polygonal boxwork ridge network (cols 55..275)
-        # Erosional breaches cut gaps through the ridges so hollows remain connected.
-        ridge_wave_1 = np.abs(np.sin(0.19 * x + 0.12 * y))
-        ridge_wave_2 = np.abs(np.cos(0.14 * x - 0.21 * y))
-        raw_ridges = 1.15 * np.exp(-8.5 * np.minimum(ridge_wave_1, ridge_wave_2) ** 2)
-
-        breach_field = 0.5 * (
-            1.0 + np.sin(0.065 * x - 0.045 * y) * np.cos(0.055 * x + 0.075 * y)
-        )
-        erosion_multiplier = np.where(breach_field < 0.35, 0.20, 1.0)
-
-        boxwork_envelope = np.exp(-((x - 165.0) / 95.0) ** 4)
-        dem += raw_ridges * erosion_multiplier * boxwork_envelope
-
-        # 3. Gediz Vallis Canyon cutting north-south around col ~365
-        channel_center = 365.0 + 14.0 * np.sin(y / 40.0)
-        dist_from_channel = np.abs(x - channel_center)
-        channel_incision = -16.0 * np.exp(-(dist_from_channel / 20.0) ** 2)
-        dem += channel_incision
-
-        # 4. Controlled boulder/talus micro-roughness along the Gediz Vallis rim
-        rim_zone = np.exp(-((dist_from_channel - 28.0) / 10.0) ** 2)
-        boulder_noise = rng.normal(0.0, 0.14, size=(rows, cols)) * rim_zone
-        micro_ripples = 0.03 * np.sin(0.6 * x) + rng.normal(0.0, 0.015, size=(rows, cols))
-        dem += boulder_noise + micro_ripples
-
-        # 5. Grade a realistic flat lander pad (< 2 deg) around Base (row=45, col=60)
-        dist_from_base = np.hypot(y - 45.0, x - 60.0)
-        pad_blend = np.exp(-(dist_from_base / 18.0) ** 4)
-        base_target_elev = float(dem[45, 60])
-        dem = dem * (1.0 - pad_blend) + base_target_elev * pad_blend
-
-        return cls(
-            dem=dem,
-            config=cfg,
-            is_synthetic=True,
-            source_label="SYNTHETIC_LAYOUT_BOXWORK_GEDIZ_VALLIS",
-            geo_origin_xy=(8136500.0, -283500.0),
-            crs_wkt="PROJCS[\"Synthetic_Mars_Local_Meters_Unverified_Scale\"]",
-        )
-
-    @staticmethod
-    def _median_filter_3x3(arr: np.ndarray) -> np.ndarray:
-        """Applies a pure-NumPy 3x3 nanmedian filter to remove isolated seam spikes.
-
-        Args:
-            arr: 2D elevation array.
-
-        Returns:
-            Filtered 2D elevation array.
-        """
-        padded = np.pad(arr, pad_width=1, mode="edge")
-        neighbors = [
-            padded[1 + dy : 1 + dy + arr.shape[0], 1 + dx : 1 + dx + arr.shape[1]]
-            for dy in (-1, 0, 1)
-            for dx in (-1, 0, 1)
-        ]
-        stacked = np.stack(neighbors, axis=0)
-        return np.nanmedian(stacked, axis=0)
-
-    def _compute_slope_deg(self) -> np.ndarray:
-        """Computes terrain slope in degrees using central finite differences.
-
-        Returns:
-            2D array of terrain slopes in degrees.
-        """
-        dz_dy, dz_dx = np.gradient(self.dem, self.config.resolution_m)
-        slope_rad = np.arctan(np.hypot(dz_dx, dz_dy))
-        return np.degrees(slope_rad)
-
-    def _compute_roughness_tri(self) -> np.ndarray:
-        """Computes a 3x3 Terrain Ruggedness Index (TRI) in pure NumPy.
-
-        Returns:
-            2D array of root-mean-square neighbor elevation differences in meters.
-        """
-        padded = np.pad(self.dem, pad_width=1, mode="edge")
-        sq_diffs = np.zeros_like(self.dem, dtype=np.float64)
-
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dy == 0 and dx == 0:
-                    continue
-                neighbor = padded[1 + dy : 1 + dy + self.rows, 1 + dx : 1 + dx + self.cols]
-                sq_diffs += (self.dem - neighbor) ** 2
-
-        return np.sqrt(sq_diffs / 8.0)
-
-    def _build_impassable_mask(self) -> np.ndarray:
-        """Identifies grid cells violating safety rules, including a 1-px NoData buffer.
-
-        Returns:
-            Boolean 2D mask where True indicates impassable/no-go terrain.
-        """
-        nan_mask = np.isnan(self.dem) | np.isnan(self.slope_deg) | np.isnan(self.roughness_m)
-
-        # Explicitly dilate NoData gaps by 1 pixel (3x3) so routes never graze missing data
-        padded_nan = np.pad(nan_mask, pad_width=1, mode="constant", constant_values=True)
-        nodata_buffer = np.zeros_like(nan_mask, dtype=bool)
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                nodata_buffer |= padded_nan[1 + dy : 1 + dy + self.rows, 1 + dx : 1 + dx + self.cols]
-
-        steep_mask = self.slope_deg > self.config.max_passable_slope_deg
-        rough_mask = self.roughness_m > self.config.max_roughness_m
-        impassable = nodata_buffer | steep_mask | rough_mask
-
-        blocked_pct = 100.0 * float(np.mean(impassable))
-        logger.info("Hazard mask built | Impassable terrain: %.1f%% of map area", blocked_pct)
-        return impassable
-
-
-# ==============================================================================
 # A* ROUTE PLANNING ENGINE
 # ==============================================================================
 class MartianEVARouter:
-    """Terrain-aware 8-connected A* route planner for Martian surface EVAs."""
+    """Terrain-aware 8-connected A* route planner backed by `hazard_layers.npz`."""
 
     _NEIGHBORS: Tuple[Tuple[int, int, float], ...] = (
         (-1, 0, 1.0),
@@ -484,34 +281,39 @@ class MartianEVARouter:
         (1, 1, 1.41421356237),
     )
 
-    def __init__(self, terrain: TerrainAnalyzer) -> None:
-        """Initializes the router with an analyzed terrain model.
+    def __init__(
+        self, surface: PrecomputedHazardSurface, config: Optional[EVACostConfig] = None
+    ) -> None:
+        """Initializes the router with precomputed hazard rasters and mission rules.
 
         Args:
-            terrain: TerrainAnalyzer containing DEM, slope, roughness, and hazard mask.
+            surface: PrecomputedHazardSurface loaded from `hazard_layers.npz`.
+            config: Optional EVACostConfig; inherits `no_go_slope_deg` if unset.
         """
-        self.terrain = terrain
-        self.config = terrain.config
+        self.surface = surface
+        self.config = config or EVACostConfig()
+        if self.config.max_passable_slope_deg is None:
+            self.config.max_passable_slope_deg = self.surface.no_go_slope_deg
 
     def snap_to_safe_cell(self, wp: Waypoint, search_radius_px: int = 8) -> Waypoint:
-        """Returns the waypoint if safe, or snaps to the nearest passable cell within radius.
+        """Returns the waypoint if passable, or snaps to the nearest safe cell within radius.
 
         Args:
             wp: Candidate Waypoint.
-            search_radius_px: Maximum pixel radius to search for safe ground.
+            search_radius_px: Maximum pixel radius to search for passable ground.
 
         Returns:
             Validated (and possibly snapped) Waypoint.
 
         Raises:
-            ValueError: If out of bounds or no safe ground exists within radius.
+            ValueError: If out of bounds or no passable ground exists within radius.
         """
-        if not (0 <= wp.row < self.terrain.rows and 0 <= wp.col < self.terrain.cols):
+        if not (0 <= wp.row < self.surface.rows and 0 <= wp.col < self.surface.cols):
             msg = f"Waypoint '{wp.name}' ({wp.row}, {wp.col}) is outside DEM bounds."
             logger.error(msg)
             raise ValueError(msg)
 
-        if not self.terrain.impassable_mask[wp.row, wp.col]:
+        if not self.surface.no_go_mask[wp.row, wp.col]:
             return wp
 
         best_cell: Optional[Tuple[int, int]] = None
@@ -520,32 +322,33 @@ class MartianEVARouter:
         for dr in range(-search_radius_px, search_radius_px + 1):
             for dc in range(-search_radius_px, search_radius_px + 1):
                 nr, nc = wp.row + dr, wp.col + dc
-                if not (0 <= nr < self.terrain.rows and 0 <= nc < self.terrain.cols):
+                if not (0 <= nr < self.surface.rows and 0 <= nc < self.surface.cols):
                     continue
-                if self.terrain.impassable_mask[nr, nc]:
+                if self.surface.no_go_mask[nr, nc]:
                     continue
                 dist = np.hypot(dr, dc)
-                score = dist + 0.15 * self.terrain.slope_deg[nr, nc]
+                score = dist + 0.25 * self.surface.cost_multiplier[nr, nc]
                 if score < best_score:
                     best_score = score
                     best_cell = (nr, nc)
 
         if best_cell is None:
             msg = (
-                f"Waypoint '{wp.name}' ({wp.row}, {wp.col}) sits on impassable ground and "
-                f"no safe cell was found within {search_radius_px} px."
+                f"Waypoint '{wp.name}' ({wp.row}, {wp.col}) sits on No-Go terrain and "
+                f"no passable cell was found within {search_radius_px} px."
             )
             logger.error(msg)
             raise ValueError(msg)
 
         logger.warning(
-            "Snapped waypoint '%s' from (%d,%d) to safer ground (%d,%d) [slope=%.1f deg]",
+            "Snapped waypoint '%s' from (%d,%d) to passable cell (%d,%d) [tier=%d, slope=%.1f deg]",
             wp.name,
             wp.row,
             wp.col,
             best_cell[0],
             best_cell[1],
-            self.terrain.slope_deg[best_cell[0], best_cell[1]],
+            int(self.surface.hazard_tier[best_cell[0], best_cell[1]]),
+            float(self.surface.slope_deg[best_cell[0], best_cell[1]]),
         )
         return Waypoint(
             name=wp.name,
@@ -555,99 +358,54 @@ class MartianEVARouter:
         )
 
     def _heuristic(self, r1: int, c1: int, r2: int, c2: int) -> float:
-        """Admissible octile-distance heuristic scaled to minimum flat-ground cost.
-
-        Args:
-            r1: Current row index.
-            c1: Current column index.
-            r2: Goal row index.
-            c2: Goal column index.
-
-        Returns:
-            Lower-bound remaining traversal cost in meters.
-        """
+        """Admissible octile-distance heuristic scaled to minimum flat-ground cost (1.0x)."""
         dr = abs(r1 - r2)
         dc = abs(c1 - c2)
         octile_steps = (dr + dc) + (1.41421356237 - 2.0) * min(dr, dc)
-        return octile_steps * self.config.resolution_m
+        return octile_steps * self.surface.resolution_m
 
     def _step_walk_speed_mps(self, signed_slope_deg: float, roughness_m: float) -> float:
-        """Computes local astronaut walking speed (m/s) for a single terrain step.
-
-        Args:
-            signed_slope_deg: Signed slope in degrees (+ uphill, - downhill).
-            roughness_m: Local 3x3 Terrain Ruggedness Index in meters.
-
-        Returns:
-            Effective walking speed in meters per second.
-        """
+        """Computes local astronaut walking speed (m/s) for a single terrain step."""
         slope_penalty = np.exp(-2.8 * abs(np.radians(signed_slope_deg + 3.0)))
-        rough_penalty = max(0.45, 1.0 - 0.5 * (roughness_m / self.config.max_roughness_m))
+        rough_penalty = max(0.45, 1.0 - 0.5 * (roughness_m / 0.85))
         speed = self.config.nominal_walk_speed_mps * slope_penalty * rough_penalty
         return float(max(0.25, speed))
 
     def _step_cost(self, r1: int, c1: int, r2: int, c2: int, dist_mult: float) -> float:
-        """Computes traversal cost between adjacent cells incorporating slope & roughness.
+        """Computes step cost using precomputed `no_go_mask` and `cost_multiplier`.
 
-        Applies an additional steep-grade surcharge above `caution_slope_deg` (15 deg)
-        so A* detours around near-limit slopes unless required to cross a ridge gap.
-
-        Args:
-            r1: Origin row index.
-            c1: Origin column index.
-            r2: Destination row index.
-            c2: Destination column index.
-            dist_mult: Planar step multiplier (1.0 cardinal, sqrt(2) diagonal).
-
-        Returns:
-            Scalar traversal cost, or np.inf if the step violates safety thresholds.
+        Applies:
+            1. Hard block from mapper's `no_go_mask` / infinite `cost_multiplier`.
+            2. Directional step-by-step slope check between `(r1, c1)` and `(r2, c2)`.
+            3. Mapper's precomputed `cost_multiplier[r2, c2]` plus uphill climb work.
         """
-        if self.terrain.impassable_mask[r2, c2]:
+        if self.surface.no_go_mask[r2, c2]:
             return np.inf
 
-        planar_dist = dist_mult * self.config.resolution_m
-        z1 = self.terrain.dem[r1, c1]
-        z2 = self.terrain.dem[r2, c2]
+        cell_multiplier = self.surface.cost_multiplier[r2, c2]
+        if np.isinf(cell_multiplier):
+            return np.inf
+
+        planar_dist = dist_mult * self.surface.resolution_m
+        z1 = self.surface.dem[r1, c1]
+        z2 = self.surface.dem[r2, c2]
         if np.isnan(z1) or np.isnan(z2):
             return np.inf
 
         dz = z2 - z1
+
+        # Directional step-by-step slope check between adjacent cells
         step_slope_deg = np.degrees(np.arctan2(abs(dz), planar_dist))
-        if step_slope_deg > self.config.max_passable_slope_deg:
+        if step_slope_deg > float(self.config.max_passable_slope_deg):
             return np.inf
 
         surface_dist = np.hypot(planar_dist, dz)
-        norm_slope = step_slope_deg / self.config.max_passable_slope_deg
-        slope_factor = 1.0 + self.config.slope_penalty_weight * (norm_slope ** 2)
+        uphill_penalty = self.config.uphill_climb_weight * max(0.0, dz)
 
-        # Extra caution surcharge above 15 deg so near-limit steps are used only in gaps
-        if step_slope_deg > self.config.caution_slope_deg:
-            excess_ratio = (step_slope_deg - self.config.caution_slope_deg) / (
-                self.config.max_passable_slope_deg - self.config.caution_slope_deg
-            )
-            slope_factor += 3.0 * (excess_ratio ** 2)
-
-        uphill_penalty = 1.6 * max(0.0, dz)
-        dest_roughness = self.terrain.roughness_m[r2, c2]
-        roughness_factor = 1.0 + self.config.roughness_penalty_weight * (
-            dest_roughness / self.config.max_roughness_m
-        )
-
-        return float(surface_dist * slope_factor * roughness_factor + uphill_penalty)
+        return float(surface_dist * cell_multiplier + uphill_penalty)
 
     def plan_leg(self, start: Waypoint, goal: Waypoint) -> LegTelemetry:
-        """Finds the optimal safe EVA path between two waypoints using A*.
-
-        Args:
-            start: Origin Waypoint.
-            goal: Target Waypoint.
-
-        Returns:
-            LegTelemetry populated with path coordinates and engineering metrics.
-
-        Raises:
-            RuntimeError: If no safe path exists under current slope/roughness limits.
-        """
+        """Finds the optimal safe EVA path between two waypoints using A*."""
         safe_start = self.snap_to_safe_cell(start)
         safe_goal = self.snap_to_safe_cell(goal)
 
@@ -699,7 +457,7 @@ class MartianEVARouter:
 
             for dr, dc, dist_mult in self._NEIGHBORS:
                 nr, nc = r + dr, c + dc
-                if not (0 <= nr < self.terrain.rows and 0 <= nc < self.terrain.cols):
+                if not (0 <= nr < self.surface.rows and 0 <= nc < self.surface.cols):
                     continue
 
                 neighbor = (nr, nc)
@@ -722,21 +480,7 @@ class MartianEVARouter:
         raise RuntimeError(err_msg)
 
     def plan_mission(self, waypoints: List[Waypoint]) -> List[LegTelemetry]:
-        """Plans a sequential multi-waypoint EVA mission with leg caching.
-
-        Caches solved `(start_node, goal_node)` legs so that walkback contingency
-        checks reuse already-planned return legs (such as the final leg back to
-        Base) without duplicate A* computation.
-
-        Args:
-            waypoints: Ordered list of Waypoint objects.
-
-        Returns:
-            List of LegTelemetry objects for each sequential traverse leg.
-
-        Raises:
-            ValueError: If fewer than 2 waypoints are provided.
-        """
+        """Plans a sequential multi-waypoint EVA mission with leg caching."""
         if len(waypoints) < 2:
             raise ValueError("Mission requires at least a start and end waypoint.")
 
@@ -744,7 +488,6 @@ class MartianEVARouter:
         base_wp = safe_waypoints[0]
         base_node = (base_wp.row, base_wp.col)
 
-        # Cache keyed by ((start_row, start_col), (goal_row, goal_col)) to avoid duplicate A* runs
         leg_cache: Dict[Tuple[Tuple[int, int], Tuple[int, int]], LegTelemetry] = {}
         legs: List[LegTelemetry] = []
 
@@ -762,8 +505,7 @@ class MartianEVARouter:
 
             legs.append(leg)
 
-        # True walkback check: evaluate safe return distance to Base from each stop,
-        # reusing cached return legs whenever already computed in the route.
+        # True walkback check: reuse cached return legs whenever available
         max_walkback_m = 0.0
         furthest_stop = base_wp.name
         checked_stops = {base_node}
@@ -797,7 +539,7 @@ class MartianEVARouter:
 
         logger.info(
             "MISSION SUMMARY [%s] | Legs: %d | Loop Dist: %.1f m | Max Walkback: %.1f m / %.1f m limit (from '%s') | Energy: %.1f kJ | Time: %.1f min",
-            "SYNTHETIC_LAYOUT" if self.terrain.is_synthetic else "REAL_DTM",
+            "SYNTHETIC_LAYOUT" if self.surface.is_synthetic_layout else "REAL_DTM",
             len(legs),
             total_dist,
             max_walkback_m,
@@ -821,15 +563,7 @@ class MartianEVARouter:
     def _reconstruct_path(
         came_from: Dict[Tuple[int, int], Tuple[int, int]], current: Tuple[int, int]
     ) -> List[Tuple[int, int]]:
-        """Reconstructs the ordered coordinate path from the A* parent map.
-
-        Args:
-            came_from: Mapping of child node to parent node.
-            current: Goal node coordinate.
-
-        Returns:
-            Ordered list of (row, col) tuples from start to goal.
-        """
+        """Reconstructs the ordered coordinate path from the A* parent map."""
         path = [current]
         while current in came_from:
             current = came_from[current]
@@ -840,16 +574,7 @@ class MartianEVARouter:
     def _compute_leg_telemetry(
         self, start_name: str, end_name: str, path: List[Tuple[int, int]]
     ) -> LegTelemetry:
-        """Calculates distance, elevation profile, steep-step counts, energy, and time.
-
-        Args:
-            start_name: Name of origin waypoint.
-            end_name: Name of destination waypoint.
-            path: Ordered list of (row, col) grid coordinates.
-
-        Returns:
-            Populated LegTelemetry instance.
-        """
+        """Calculates distance, elevation profile, steep-step counts, energy, and time."""
         total_dist = 0.0
         elev_gain = 0.0
         elev_loss = 0.0
@@ -865,13 +590,13 @@ class MartianEVARouter:
             r1, c1 = path[i]
             r2, c2 = path[i + 1]
 
-            planar_dist = np.hypot(r2 - r1, c2 - c1) * self.config.resolution_m
-            dz = self.terrain.dem[r2, c2] - self.terrain.dem[r1, c1]
+            planar_dist = np.hypot(r2 - r1, c2 - c1) * self.surface.resolution_m
+            dz = self.surface.dem[r2, c2] - self.surface.dem[r1, c1]
             step_dist = np.hypot(planar_dist, dz)
 
             signed_slope = np.degrees(np.arctan2(dz, planar_dist))
             abs_slope = abs(signed_slope)
-            step_rough = float(self.terrain.roughness_m[r2, c2])
+            step_rough = float(self.surface.roughness_tri_m[r2, c2])
 
             if abs_slope > 15.0:
                 steps_over_15 += 1
@@ -894,8 +619,6 @@ class MartianEVARouter:
 
         mean_slope = (weighted_slope_sum / total_dist) if total_dist > 0 else 0.0
 
-        # First-order metabolic energy model: horizontal locomotion + uphill climb work.
-        # Downhill segments (dz < 0) contribute zero positive climb work in this baseline.
         base_locomotion_j = 2.8 * self.config.astronaut_total_mass_kg * total_dist
         climb_work_j = (
             self.config.astronaut_total_mass_kg * MARS_GRAVITY_MPS2 * elev_gain
@@ -924,22 +647,18 @@ class MartianEVARouter:
 # EXPORT & DIAGNOSTIC VISUALIZATION
 # ==============================================================================
 def export_mission_geojson(
-    legs: List[LegTelemetry], terrain: TerrainAnalyzer, output_path: str = "eva_route.geojson"
+    legs: List[LegTelemetry],
+    surface: PrecomputedHazardSurface,
+    output_path: str = "eva_route.geojson",
 ) -> None:
-    """Exports the solved multi-leg EVA traverse to a geospatial GeoJSON FeatureCollection.
-
-    Args:
-        legs: List of solved LegTelemetry objects.
-        terrain: TerrainAnalyzer containing elevation data and spatial metadata.
-        output_path: Destination GeoJSON file path.
-    """
+    """Exports the solved multi-leg EVA traverse to a geospatial GeoJSON FeatureCollection."""
     features = []
     for idx, leg in enumerate(legs, start=1):
         coords_3d = []
         pixel_coords = []
         for r, c in leg.path_coords:
-            x_geo, y_geo = terrain.pixel_to_map_xy(r, c)
-            z_elev = round(float(terrain.dem[r, c]), 3)
+            x_geo, y_geo = surface.pixel_to_map_xy(r, c)
+            z_elev = round(float(surface.dem[r, c]), 3)
             coords_3d.append([round(x_geo, 3), round(y_geo, 3), z_elev])
             pixel_coords.append([int(c), int(r)])
 
@@ -950,8 +669,8 @@ def export_mission_geojson(
                     "leg_number": idx,
                     "from": leg.start_name,
                     "to": leg.end_name,
-                    "is_synthetic_layout": terrain.is_synthetic,
-                    "terrain_source": terrain.source_label,
+                    "is_synthetic_layout": surface.is_synthetic_layout,
+                    "terrain_source": surface.source_label,
                     "distance_m": round(leg.distance_m, 2),
                     "elevation_gain_m": round(leg.elevation_gain_m, 2),
                     "mean_slope_deg": round(leg.mean_slope_deg, 2),
@@ -970,15 +689,15 @@ def export_mission_geojson(
     collection = {
         "type": "FeatureCollection",
         "metadata": {
-            "is_synthetic_layout": terrain.is_synthetic,
+            "is_synthetic_layout": surface.is_synthetic_layout,
             "scale_disclaimer": (
                 "SYNTHETIC LAYOUT (~250 m synthetic separation; verify real feature "
                 "spacing on a calibrated HiRISE DTEEC DTM before operational use)."
-                if terrain.is_synthetic
+                if surface.is_synthetic_layout
                 else "Derived from calibrated HiRISE DTM GeoTIFF."
             ),
-            "source_label": terrain.source_label,
-            "crs": terrain.crs_wkt,
+            "source_label": surface.source_label,
+            "crs": surface.crs_wkt,
         },
         "features": features,
     }
@@ -988,41 +707,36 @@ def export_mission_geojson(
 
 
 def save_route_preview(
-    terrain: TerrainAnalyzer,
+    surface: PrecomputedHazardSurface,
     waypoints: List[Waypoint],
     legs: List[LegTelemetry],
     output_png: str = "eva_route_preview.png",
 ) -> None:
-    """Saves a 2-panel diagnostic visualization (Elevation + Hazard/Route overlay).
-
-    Args:
-        terrain: TerrainAnalyzer instance.
-        waypoints: Mission Waypoint list.
-        legs: Solved LegTelemetry list.
-        output_png: Destination PNG image path.
-    """
+    """Overlays the solved route directly onto the mapper's 4-Tier Hazard & Obstacle Map."""
     if not HAS_MATPLOTLIB:
         logger.warning("matplotlib not installed; skipping PNG preview generation.")
         return
 
-    tag = "[SYNTHETIC LAYOUT] " if terrain.is_synthetic else ""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), dpi=150)
+    tag = "[SYNTHETIC LAYOUT] " if surface.is_synthetic_layout else ""
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6), dpi=150)
 
-    im0 = axes[0].imshow(terrain.dem, cmap="terrain", origin="upper")
+    # Panel 1: Elevation Model (DEM) from hazard_layers.npz
+    im0 = axes[0].imshow(surface.dem, cmap="terrain", origin="upper")
     axes[0].set_title(f"{tag}Mount Sharp Boxwork + Gediz Vallis DEM (m)")
     axes[0].set_xlabel("East-West Distance (m)")
     axes[0].set_ylabel("North-South Distance (m)")
     fig.colorbar(im0, ax=axes[0], shrink=0.8, label="Elevation (m)")
 
-    im1 = axes[1].imshow(terrain.slope_deg, cmap="inferno", vmin=0, vmax=25, origin="upper")
-    axes[1].contour(
-        terrain.impassable_mask, levels=[0.5], colors="cyan", linewidths=0.7, alpha=0.85
-    )
-    axes[1].set_title(f"{tag}Slope Hazard Map (deg) & Optimal EVA Route")
+    # Panel 2: Mapper's 4-Tier Hazard & Obstacle Map + Solved EVA Traverse
+    tier_cmap = ListedColormap(["#1b4332", "#e9c46a", "#f4a261", "#d62828"])
+    tier_norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], tier_cmap.N)
+    im1 = axes[1].imshow(surface.hazard_tier, cmap=tier_cmap, norm=tier_norm, origin="upper")
+    axes[1].set_title(f"{tag}4-Tier Hazard Map & Obstacle-Avoiding Route")
     axes[1].set_xlabel("East-West Distance (m)")
-    fig.colorbar(im1, ax=axes[1], shrink=0.8, label="Slope (deg)")
+    cbar = fig.colorbar(im1, ax=axes[1], ticks=[0, 1, 2, 3], shrink=0.8)
+    cbar.ax.set_yticklabels(["Nominal", "Caution", "High-Cost", "No-Go (Rock/Cliff)"], fontsize=8)
 
-    colors = ["#00FF7F", "#FFD700", "#00BFFF"]
+    colors = ["#00FFFF", "#FFFFFF", "#FF66FF"]
     for idx, leg in enumerate(legs):
         rows = [pt[0] for pt in leg.path_coords]
         cols = [pt[1] for pt in leg.path_coords]
@@ -1042,36 +756,32 @@ def save_route_preview(
             color="white",
             fontsize=8,
             fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.65),
+            bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.75),
         )
 
     axes[1].legend(loc="lower left", fontsize=8)
     plt.tight_layout()
     plt.savefig(output_png)
     plt.close(fig)
-    logger.info("Saved diagnostic route plot to %s", output_png)
+    logger.info("Saved unified route-on-hazard plot to %s", output_png)
 
 
 # ==============================================================================
-# ENTRY POINT (DEMONSTRATION RUN)
+# ENTRY POINT (REQUIRES HAZARD_LAYERS.NPZ FROM TERRAIN_HAZARD_MAPPER.PY)
 # ==============================================================================
 if __name__ == "__main__":
     try:
+        # 1. Load single-source-of-truth terrain & hazard rasters
+        hazard_surface = PrecomputedHazardSurface.from_npz("hazard_layers.npz")
+
+        # 2. Configure EVA mission rules (inherits max_passable_slope_deg from .npz)
         eva_config = EVACostConfig(
-            resolution_m=1.0,
-            max_passable_slope_deg=22.0,
-            caution_slope_deg=15.0,
-            max_roughness_m=0.85,
+            astronaut_total_mass_kg=180.0,
+            nominal_walk_speed_mps=0.85,
             max_walkback_distance_m=1500.0,
-            despike_hirise_seams=False,
         )
 
-        # Swap with TerrainAnalyzer.from_geotiff("<verified_DTEEC_product>.tif", eva_config)
-        # once your HiRISE DTM cutout is verified and downloaded from UA HiRISE / PDS.
-        analyzer = TerrainAnalyzer.from_synthetic_mount_sharp(
-            rows=350, cols=450, config=eva_config
-        )
-
+        # 3. Solve dual-target EVA loop
         mission_waypoints = [
             Waypoint(name="HAB / Rover Base", row=45, col=60, science_priority="BASE"),
             Waypoint(name="Boxwork Vein Node", row=195, col=180, science_priority="PRIMARY"),
@@ -1079,11 +789,13 @@ if __name__ == "__main__":
             Waypoint(name="HAB / Rover Base", row=45, col=60, science_priority="BASE"),
         ]
 
-        router = MartianEVARouter(terrain=analyzer)
+        router = MartianEVARouter(surface=hazard_surface, config=eva_config)
         solved_legs = router.plan_mission(mission_waypoints)
 
-        export_mission_geojson(solved_legs, analyzer, output_path="eva_route.geojson")
-        save_route_preview(analyzer, mission_waypoints, solved_legs, output_png="eva_route_preview.png")
+        export_mission_geojson(solved_legs, hazard_surface, output_path="eva_route.geojson")
+        save_route_preview(
+            hazard_surface, mission_waypoints, solved_legs, output_png="eva_route_preview.png"
+        )
 
     except Exception as exc:
         logger.exception("Fatal error during Martian EVA route execution: %s", exc)

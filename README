@@ -1,0 +1,159 @@
+# Martian EVA Route & Hazard Mapping Engine (Gale Crater)
+
+**NASA Space Apps Challenge — *Martian Map***
+
+A terrain-aware hazard classification and Extravehicular Activity (EVA) route planning pipeline designed for human surface exploration on the lower flank of **Aeolis Mons (Mount Sharp)** in Gale Crater, Mars. The system ingests 1.0 m/pixel Digital Terrain Models (DTMs) to classify slope, surface roughness, and local rock protrusions, then computes safe, metabolically optimized astronaut traverses between high-priority astrobiological and geochemical targets.
+
+---
+
+## 1. Mission Site Selection & Scientific Rationale
+
+Rather than modeling a flat, well-characterized crater floor site or an unrealistic multi-day rover traverse, this mission targets two geologically distinct, adjacent features on Mount Sharp within a single astronaut EVA walkback radius:
+
+| Role | Target Site | Approximate Coordinates | Scientific Mandate | Routing & Terrain Challenge |
+| :--- | :--- | :--- | :--- | :--- |
+| **Primary Site** | **Mount Sharp Boxwork** *(Altadena Member)* | `~4.79° S, 137.42° E` | **Subsurface Habitability & Climate Transition:** Mineralized fracture-fill ridges (1–2 m tall) formed by late-stage groundwater as Mars dried out—prime targets for shielded organic biosignatures and resurgent calcium sulfate veins. | **Micro-Navigation:** Threading through ~9–10 m wide sandy hollows and eroded ridge breaches while avoiding steep ridge crests. |
+| **Secondary Anomaly** | **Gediz Vallis Channel** *(Western Rim)* | `~4.75° S, 137.41° E` | **Geochemical Anomaly Sampling:** Curiosity exposed pure elemental sulfur ($S_8$) crystals too fragile for robotic rotary-percussion drilling—a textbook task requiring gloved human field geology. | **Macro-Hazard Avoidance:** Navigating rocky rim talus while enforcing hard No-Go boundaries along sheer canyon walls (`> 22°`). |
+
+### Why Alternative Sites Were Excluded
+* **Bradbury Landing / Hottah & Link Conglomerates (Excluded):** Located ~11.8 km north-northeast on the flat crater floor (`~4.59° S, 137.44° E`), the terrain offers minimal slope or obstacle complexity for a hazard-routing engine and lies too far from Mount Sharp to combine into a single EVA.
+* **Peace Vallis to Upper Mount Sharp Traverse (Excluded):** Spanning >18 km across multiple geological eras, a full river-to-mountain profile requires a multi-day pressurized rover expedition and exceeds single-EVA suit walkback limits.
+
+---
+
+## 2. System Architecture (Single Source of Truth)
+
+To guarantee that every obstacle shown on the hazard map matches the pathfinder's routing decisions 1:1, the pipeline enforces a strict **single-source-of-truth** architecture:
+
+```text
+  [ HiRISE Metric DTM (.tif) ]  OR  [ Synthetic Mount Sharp Layout ]
+                             │
+                             ▼
+             ┌───────────────────────────────┐
+             │   terrain_hazard_mapper.py    │  (Pre-Routing Layer)
+             │  • Slope (deg) & 3x3 TRI (m)  │
+             │  • 3x3 Rock Protrusion Index  │
+             │  • 1-px NoData Safety Buffer  │
+             │  • 4-Tier Hazard & Cost Grid  │
+             └───────────────┬───────────────┘
+                             │
+               Exports `hazard_layers.npz` &
+                 `hazard_manifest.json`
+                             │
+                             ▼
+             ┌───────────────────────────────┐
+             │     martian_eva_router.py     │  (Pathfinding Engine)
+             │  • 8-Connected A* Search      │
+             │  • Directional Step-Slope Cap │
+             │  • Step-Integrated Walk Time  │
+             │  • Leg Cache & Walkback Check │
+             └───────────────┬───────────────┘
+                             │
+                             ▼
+   [ eva_route.geojson ]  [ eva_route_preview.png ]  [ eva_mission_report.md ]
+```
+
+### Repository Files
+* **`terrain_hazard_mapper.py`**: Standalone pre-routing processor that converts raw elevation rasters into continuous terrain derivatives, a 4-tier discrete hazard grid, and a continuous traversal cost surface (`hazard_layers.npz`).
+* **`martian_eva_router.py`**: 8-connected A* pathfinder that loads `hazard_layers.npz` directly, enforces step-by-step directional slope limits, caches solved legs, validates suit walkback contingencies, and exports 3D GeoJSON routes.
+* **`run_eva_pipeline.py`**: Unified command-line orchestrator that chains the mapper, router, diagnostic plotters, and Markdown mission report generator in a single command.
+
+---
+
+## 3. Terrain & Hazard Classification Model
+
+`terrain_hazard_mapper.py` evaluates every 1.0 m grid cell across three physical derivatives before classifying it into four operational tiers:
+
+1. **Terrain Slope ($\theta$, degrees):** Computed via central finite differences (`np.gradient`) across the elevation raster.
+2. **Surface Micro-Roughness (`roughness_tri_m`):** 3×3 Terrain Ruggedness Index (root-mean-square elevation difference between each cell and its 8 neighbors), capturing uneven talus and step hazards.
+3. **Rock Protrusion Index (`rock_protrusion_index_m`):** Positive 3×3 Topographic Position Index (`max(0, z_center - mean(z_8_neighbors))`), isolating discrete boulders and sharp rock fins that spatial slope gradients can smooth over.
+
+| Tier | Classification | Trigger Thresholds `[Mission Assumptions]` | Cost Multiplier | Router Behavior |
+| :---: | :--- | :--- | :---: | :--- |
+| **0** | **Nominal (Safe)** | `slope <= 10.0°` AND `TRI <= 0.25 m` AND `protrusion <= 0.30 m` | `1.0x` | Preferred travel corridors (sandy boxwork hollows & flat lander pad). |
+| **1** | **Caution** | `10.0° < slope <= 15.0°` OR `0.25 m < TRI <= 0.50 m` | `1.3x – 2.5x` | Gentle flank ramps and shallow ridge margins; traversed freely when direct. |
+| **2** | **High-Cost** | `15.0° < slope <= 22.0°` OR `0.50 m < TRI <= 0.85 m` OR `0.30 m < protrusion <= 0.65 m` | `3.0x – 8.5x` | Steep ridge gaps and rocky talus; A* detours unless crossing saves major distance. |
+| **3** | **No-Go (Blocked)** | `slope > 22.0°` OR `TRI > 0.85 m` OR `protrusion > 0.65 m` OR `1-px NoData buffer` | `inf` | Hard blocked: Gediz Vallis canyon walls, large rock outcrops, and data voids. |
+
+### Data Integrity Safeguards
+* **Deterministic NoData Safety Buffer:** Any missing (`NaN`) elevation pixel is dilated by a 1-pixel (3×3) buffer so routes never graze raster voids, while valid outer map borders remain passable unless hazardous.
+* **HiRISE Stereo Seam Despiking (`--despike-seams`):** Optional 3×3 `nanmedian` pre-filter to suppress ~0.5–1.0 m rectangular stereo correlation seam artifacts documented in some NASA PDS HiRISE DTMs.
+
+---
+
+## 4. A* Pathfinding & Astronaut Biomechanics
+
+* **Admissible Heuristic:** Uses 8-connected octile distance scaled to flat-ground `1.0x` cost, guaranteeing optimal minimum-cost paths without overestimation.
+* **Directional Step-Slope Check:** In addition to reading cell-level `cost_multiplier` and `no_go_mask` from `hazard_layers.npz`, `_step_cost()` computes the exact directional transition slope (`arctan2(|z2 - z1|, planar_dist)`) between every adjacent pixel pair, blocking any step exceeding `max_passable_slope_deg` (`22.0°`).
+* **Step-by-Step Walking Speed:** Walking duration is integrated pixel-by-pixel using a Tobler-inspired velocity curve adapted for pressurized Mars suits (`0.85 m/s` nominal flat speed, peaking on gentle `-3°` downslopes and slowing on steep climbs, braking descents, and rough ground) rather than penalizing an entire leg by its single steepest step.
+* **Leg Caching & Walkback Contingency:** `plan_mission()` caches every solved `(start, goal)` leg so walkback checks reuse already-computed return paths without duplicate A* runs, verifying that the worst-case safe return path from any science stop back to Base stays within `max_walkback_distance_m` (`1500.0 m`).
+
+---
+
+## 5. Installation & Quickstart
+
+### Prerequisites
+* Python 3.10+
+* Core dependency: `numpy`
+* Optional GIS & plotting dependencies: `rasterio` (for real HiRISE GeoTIFF ingestion) and `matplotlib` (for diagnostic PNG maps)
+
+```bash
+pip install numpy rasterio matplotlib
+```
+
+### 1. Run Standalone Verification (Synthetic Mount Sharp Layout)
+```bash
+python3 run_eva_pipeline.py --synthetic --output-dir ./demo_synthetic
+```
+
+### 2. Run on a Calibrated HiRISE DTM GeoTIFF
+```bash
+python3 run_eva_pipeline.py \
+  --geotiff path/to/verified_DTEEC_product.tif \
+  --despike-seams \
+  --no-go-slope 22.0 \
+  --max-walkback 1500.0 \
+  --output-dir ./mission_hirise
+```
+
+### 3. Run with Custom Mission Waypoints
+Create a `waypoints.json` file (row/col grid indices; index `0` is treated as the HAB/Lander Base for walkback verification):
+
+```json
+[
+  {"name": "HAB / Rover Base", "row": 45, "col": 60, "priority": "BASE"},
+  {"name": "Boxwork Vein Node", "row": 195, "col": 180, "priority": "PRIMARY"},
+  {"name": "Gediz Sulfur Rim", "row": 255, "col": 298, "priority": "ANOMALY"},
+  {"name": "HAB / Rover Base", "row": 45, "col": 60, "priority": "BASE"}
+]
+```
+
+```bash
+python3 run_eva_pipeline.py --synthetic --waypoints waypoints.json --output-dir ./custom_run
+```
+
+---
+
+## 6. Generated Output Artifacts
+
+Each pipeline run writes a self-contained bundle to `--output-dir`:
+
+| Artifact | Format | Description |
+| :--- | :--- | :--- |
+| `hazard_layers.npz` | Compressed NumPy | Single-source-of-truth archive containing `dem`, `slope_deg`, `roughness_tri_m`, `rock_protrusion_index_m`, `hazard_tier`, `cost_multiplier`, and `no_go_mask`. |
+| `hazard_manifest.json` | JSON | Audit log of raster CRS, grid dimensions, elevation range, tier coverage percentages, and threshold assumptions. |
+| `terrain_hazard_map.png` | PNG (150 DPI) | 3-panel pre-routing diagnostic showing hillshaded DEM relief, continuous slope angles, and the 4-tier hazard map. |
+| `eva_route.geojson` | GeoJSON | 3D `[Easting, Northing, Elevation]` `LineString` features for each traverse leg with distance, slope, steep-step counts, duration, and metabolic energy telemetry. |
+| `eva_route_preview.png` | PNG (150 DPI) | 2-panel verification map overlaying the solved EVA traverse directly onto the 4-tier hazard and obstacle map. |
+| `eva_mission_report.md` | Markdown | Formatted engineering summary report printed to stdout and saved to disk. |
+| `pipeline.log` | Text Log | Timestamped, line-numbered execution log formatted for terminal and mobile SSH monitoring. |
+
+---
+
+## 7. Engineering Assumptions & Model Disclosures
+
+* **Synthetic Layout vs. Real HiRISE DTM:** When invoked with `--synthetic`, the pipeline generates a clearly labeled **synthetic layout** (`SYNTHETIC_LAYOUT_BOXWORK_GEDIZ_VALLIS`) where fractured boxwork ridges and Gediz Vallis sit ~250 m apart to validate pathfinding, obstacle avoidance, and telemetry exports. Exact stereo DTM product IDs (`DTEEC_*` GeoTIFFs in metric vertical units) covering the Mount Sharp boxwork and Gediz Vallis must be verified in the University of Arizona HiRISE DTM catalog prior to operational runs.
+* **Biomechanical & Suit Assumptions:** Baseline parameters assume an `180 kg` suited astronaut mass, `0.85 m/s` flat-ground walking speed, `22.0°` hard slope cutoff, `0.85 m` 3×3 TRI limit, and `1500 m` maximum walkback distance.
+* **First-Order Metabolic Energy Model:** Estimated energy (`kJ`) sums horizontal suit locomotion (`2.8 J/kg/m`) and positive gravitational climb work (`m * g_mars * max(0, dz) / 0.25` muscle efficiency, where `g_mars = 3.721 m/s²`). Downhill segments (`dz < 0`) contribute zero positive climb work in this baseline model, explaining why downhill return legs report lower energy than outbound climbs (in real pressurized suits, eccentric braking on steep descents adds moderate metabolic load).
+* **Rock Protrusion Index:** Computed as elevation above the immediate 8-neighbor mean (`positive 3x3 TPI`). Because 1–2 m wide boulders also elevate adjacent ring pixels, this metric represents local crest prominence rather than true base-to-peak rock height.
+* **Steep-Step Transitions (`20°–22°`):** Although the router applies a nonlinear cost surcharge above `15.0°`, routes may occasionally traverse 1–2 pixels in the `20°–21.9°` band (`steps_over_20deg` in telemetry) to cross narrow eroded gaps between boxwork ridges rather than taking multi-hundred-meter detours.

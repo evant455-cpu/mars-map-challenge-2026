@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""Unified Command-Line Runner for the Martian EVA Route & Hazard Pipeline.
+
+Orchestrates the end-to-end workflow for the NASA Space Apps Martian Map
+challenge by chaining:
+    1. `terrain_hazard_mapper.py` (Single Source of Truth): Ingests a metric
+       HiRISE DTM GeoTIFF or generates a clearly labeled synthetic Mount Sharp
+       layout, computing slope, 3x3 roughness (TRI), Rock Protrusion Index,
+       and the 4-tier hazard cost surface (`hazard_layers.npz`).
+    2. `martian_eva_router.py`: Reads `hazard_layers.npz` directly, solves the
+       multi-waypoint EVA loop via 8-connected A*, verifies suit walkback
+       contingency limits, and exports `eva_route.geojson` and diagnostic plots.
+    3. Mission Report Generator: Writes a structured Markdown engineering report
+       (`eva_mission_report.md`) summarizing terrain coverage, leg telemetry,
+       steep-step counts, walkback safety status, and model assumptions.
+
+Example:
+    Run standalone verification on the synthetic Mount Sharp layout:
+        $ python3 run_eva_pipeline.py --synthetic --output-dir ./run_synthetic
+
+    Run on a calibrated HiRISE DTM GeoTIFF with stereo seam despiking:
+        $ python3 run_eva_pipeline.py --geotiff DTEEC_clipped.tif --despike-seams --output-dir ./run_hirise
+"""
+
+import argparse
+from datetime import datetime, timezone
+import json
+import logging
+from pathlib import Path
+import sys
+import time
+from typing import Any, Dict, List, Tuple
+import numpy as np
+
+# Import single-source-of-truth mapper and router modules
+try:
+    from terrain_hazard_mapper import (
+        HazardMapProduct,
+        HazardThresholds,
+        TerrainHazardMapper,
+        TIER_CAUTION,
+        TIER_HIGH_COST,
+        TIER_NO_GO,
+        TIER_NOMINAL,
+        save_hazard_artifacts,
+        save_hazard_preview,
+    )
+    from martian_eva_router import (
+        EVACostConfig,
+        LegTelemetry,
+        MartianEVARouter,
+        PrecomputedHazardSurface,
+        Waypoint,
+        export_mission_geojson,
+        save_route_preview,
+    )
+except ImportError as import_err:
+    print(
+        f"CRITICAL: Ensure 'terrain_hazard_mapper.py' and 'martian_eva_router.py' "
+        f"are in the same directory or PYTHONPATH. Details: {import_err}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+# ==============================================================================
+# LOGGING CONFIGURATION (MOBILE-FRIENDLY TERMINAL & FILE TELEMETRY)
+# ==============================================================================
+def setup_pipeline_logger(log_path: Path, level: int = logging.INFO) -> logging.Logger:
+    """Configures compact, line-numbered logging for terminal and mobile SSH review.
+
+    Args:
+        log_path: Destination path for the persistent pipeline log file.
+        level: Logging severity threshold (e.g., logging.INFO).
+
+    Returns:
+        Configured logging.Logger instance.
+    """
+    logger = logging.getLogger("MartianEVAPipeline")
+    logger.setLevel(level)
+
+    # Clear existing handlers if invoked multiple times in tests
+    if logger.handlers:
+        logger.handlers.clear()
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-7s | %(funcName)s:%(lineno)d | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    return logger
+
+
+# ==============================================================================
+# WAYPOINT LOADING & WALKBACK EVALUATION HELPERS
+# ==============================================================================
+def load_waypoints(waypoints_json: str | None, logger: logging.Logger) -> List[Waypoint]:
+    """Loads mission waypoints from a JSON file or returns default Mount Sharp stops.
+
+    Expected JSON format:
+        [
+            {"name": "HAB / Rover Base", "row": 45, "col": 60, "priority": "BASE"},
+            {"name": "Boxwork Vein Node", "row": 195, "col": 180, "priority": "PRIMARY"}
+        ]
+
+    Args:
+        waypoints_json: Optional path to a JSON file containing waypoint dicts.
+        logger: Active pipeline logger.
+
+    Returns:
+        Ordered list of Waypoint objects.
+
+    Raises:
+        FileNotFoundError: If a specified JSON file does not exist.
+        ValueError: If the JSON structure is missing required keys or has < 2 stops.
+    """
+    if waypoints_json is None:
+        logger.info("Using default dual-target Mount Sharp EVA waypoints (Base -> Boxwork -> Gediz -> Base).")
+        return [
+            Waypoint(name="HAB / Rover Base", row=45, col=60, science_priority="BASE"),
+            Waypoint(name="Boxwork Vein Node", row=195, col=180, science_priority="PRIMARY"),
+            Waypoint(name="Gediz Sulfur Rim", row=255, col=298, science_priority="ANOMALY"),
+            Waypoint(name="HAB / Rover Base", row=45, col=60, science_priority="BASE"),
+        ]
+
+    wp_path = Path(waypoints_json)
+    if not wp_path.exists():
+        logger.error("Waypoints JSON file not found: %s", waypoints_json)
+        raise FileNotFoundError(f"Waypoints file not found: {waypoints_json}")
+
+    with open(wp_path, "r", encoding="utf-8") as f:
+        raw_items = json.load(f)
+
+    if not isinstance(raw_items, list) or len(raw_items) < 2:
+        raise ValueError("Waypoints JSON must be a list of at least 2 waypoint objects.")
+
+    waypoints: List[Waypoint] = []
+    for idx, item in enumerate(raw_items):
+        try:
+            waypoints.append(
+                Waypoint(
+                    name=str(item["name"]),
+                    row=int(item["row"]),
+                    col=int(item["col"]),
+                    science_priority=str(item.get("priority", "PRIMARY")),
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Malformed waypoint entry at index {idx}: {item}") from exc
+
+    logger.info("Loaded %d custom waypoints from %s", len(waypoints), waypoints_json)
+    return waypoints
+
+
+def evaluate_walkback_contingency(
+    router: MartianEVARouter,
+    waypoints: List[Waypoint],
+    solved_legs: List[LegTelemetry],
+) -> Tuple[float, str]:
+    """Computes the worst-case return-to-base path distance across all stops.
+
+    Reuses already-solved return legs in `solved_legs` (e.g., final leg back to
+    Base) to avoid redundant A* pathfinding runs.
+
+    Args:
+        router: Initialized MartianEVARouter.
+        waypoints: Mission waypoint list (index 0 is treated as Base).
+        solved_legs: Legs already solved during `plan_mission()`.
+
+    Returns:
+        Tuple of `(max_walkback_distance_m, furthest_stop_name)`.
+    """
+    safe_wps = [router.snap_to_safe_cell(wp) for wp in waypoints]
+    base_wp = safe_wps[0]
+    base_node = (base_wp.row, base_wp.col)
+
+    # Index already-computed legs by (start_node, end_node)
+    existing_leg_map: Dict[Tuple[Tuple[int, int], Tuple[int, int]], LegTelemetry] = {}
+    for idx in range(len(safe_wps) - 1):
+        key = (
+            (safe_wps[idx].row, safe_wps[idx].col),
+            (safe_wps[idx + 1].row, safe_wps[idx + 1].col),
+        )
+        existing_leg_map[key] = solved_legs[idx]
+
+    max_walkback_m = 0.0
+    furthest_stop = base_wp.name
+    checked_nodes = {base_node}
+
+    for wp in safe_wps[1:]:
+        node = (wp.row, wp.col)
+        if node in checked_nodes:
+            continue
+        checked_nodes.add(node)
+
+        return_key = (node, base_node)
+        if return_key in existing_leg_map:
+            return_leg = existing_leg_map[return_key]
+        else:
+            return_leg = router.plan_leg(wp, base_wp)
+
+        if return_leg.distance_m > max_walkback_m:
+            max_walkback_m = return_leg.distance_m
+            furthest_stop = wp.name
+
+    return max_walkback_m, furthest_stop
+
+
+# ==============================================================================
+# SUMMARY REPORT GENERATOR
+# ==============================================================================
+def write_mission_report(
+    report_path: Path,
+    hazard_product: HazardMapProduct,
+    thresholds: HazardThresholds,
+    eva_config: EVACostConfig,
+    legs: List[LegTelemetry],
+    max_walkback_m: float,
+    furthest_stop: str,
+    elapsed_sec: float,
+    artifact_paths: Dict[str, Path],
+) -> str:
+    """Generates a Markdown engineering summary report and saves it to disk.
+
+    Args:
+        report_path: Output path for `eva_mission_report.md`.
+        hazard_product: Output from `TerrainHazardMapper`.
+        thresholds: Hazard classification thresholds used.
+        eva_config: EVA biomechanical and safety configuration used.
+        legs: List of solved `LegTelemetry` objects.
+        max_walkback_m: Worst-case safe return distance to Base (m).
+        furthest_stop: Name of the stop with the longest return path.
+        elapsed_sec: Total wall-clock pipeline execution time in seconds.
+        artifact_paths: Dictionary of generated output file paths.
+
+    Returns:
+        The formatted Markdown report string.
+    """
+    timestamp_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    total_px = float(hazard_product.hazard_tier.size)
+
+    pct_nominal = 100.0 * float(np.sum(hazard_product.hazard_tier == TIER_NOMINAL)) / total_px
+    pct_caution = 100.0 * float(np.sum(hazard_product.hazard_tier == TIER_CAUTION)) / total_px
+    pct_high = 100.0 * float(np.sum(hazard_product.hazard_tier == TIER_HIGH_COST)) / total_px
+    pct_nogo = 100.0 * float(np.sum(hazard_product.hazard_tier == TIER_NO_GO)) / total_px
+
+    total_dist_m = sum(leg.distance_m for leg in legs)
+    total_gain_m = sum(leg.elevation_gain_m for leg in legs)
+    total_loss_m = sum(leg.elevation_loss_m for leg in legs)
+    total_energy_kj = sum(leg.estimated_energy_kj for leg in legs)
+    total_time_min = sum(leg.estimated_duration_min for leg in legs)
+    total_steps_20 = sum(leg.steps_over_20deg for leg in legs)
+    total_dist_20_m = sum(leg.steep_distance_over_20deg_m for leg in legs)
+
+    walkback_ok = max_walkback_m <= eva_config.max_walkback_distance_m
+    walkback_status = "PASS (WITHIN LIMIT)" if walkback_ok else "FAIL (EXCEEDS LIMIT)"
+
+    scale_banner = (
+        "> **SYNTHETIC LAYOUT NOTICE:** Generated from a synthetic Mount Sharp test DEM "
+        "(~250 m synthetic separation between boxwork ridges and Gediz Vallis). Replace with "
+        "a verified HiRISE `DTEEC_*` GeoTIFF for operational planetary coordinates.\n"
+        if hazard_product.is_synthetic_layout
+        else f"> **VERIFIED RASTER SOURCE:** `{hazard_product.source_label}` (`{hazard_product.crs_wkt}`)\n"
+    )
+
+    lines: List[str] = [
+        "# Martian EVA Mission & Hazard Analysis Report",
+        f"- **Generated:** {timestamp_utc}",
+        f"- **Pipeline Runtime:** {elapsed_sec:.2f} s",
+        f"- **Terrain Source:** `{hazard_product.source_label}` (`Synthetic={hazard_product.is_synthetic_layout}`)",
+        f"- **Grid Dimensions:** {hazard_product.dem.shape[0]} rows x {hazard_product.dem.shape[1]} cols ({hazard_product.resolution_m:.2f} m/px)",
+        f"- **Elevation Range:** {float(np.nanmin(hazard_product.dem)):.2f} m to {float(np.nanmax(hazard_product.dem)):.2f} m",
+        "",
+        scale_banner,
+        "## 1. Terrain & Hazard Classification Summary",
+        "| Hazard Tier | Classification | Terrain Coverage | Criteria `[Mission Assumptions]` |",
+        "| :--- | :--- | :---: | :--- |",
+        f"| **Tier 0** | Nominal (Safe) | {pct_nominal:.1f}% | Slope <= {thresholds.caution_slope_deg:.1f} deg, TRI <= {thresholds.caution_roughness_m:.2f} m, Protrusion <= {thresholds.high_cost_protrusion_m:.2f} m |",
+        f"| **Tier 1** | Caution | {pct_caution:.1f}% | Slope {thresholds.caution_slope_deg:.1f}-{thresholds.high_cost_slope_deg:.1f} deg or TRI {thresholds.caution_roughness_m:.2f}-{thresholds.high_cost_roughness_m:.2f} m |",
+        f"| **Tier 2** | High-Cost | {pct_high:.1f}% | Slope {thresholds.high_cost_slope_deg:.1f}-{thresholds.no_go_slope_deg:.1f} deg, TRI {thresholds.high_cost_roughness_m:.2f}-{thresholds.no_go_roughness_m:.2f} m, or Protrusion {thresholds.high_cost_protrusion_m:.2f}-{thresholds.no_go_protrusion_m:.2f} m |",
+        f"| **Tier 3** | No-Go (Blocked) | {pct_nogo:.1f}% | Slope > {thresholds.no_go_slope_deg:.1f} deg, TRI > {thresholds.no_go_roughness_m:.2f} m, Protrusion > {thresholds.no_go_protrusion_m:.2f} m, or 1-px NoData buffer |",
+        "",
+        "## 2. EVA Traverse Telemetry (Leg-by-Leg)",
+        "| Leg | Route | Distance (m) | Climb / Descent (m) | Mean / Max Slope | Steps >20 deg | Est. Time (min) | Est. Energy (kJ) |",
+        "| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
+    ]
+
+    for idx, leg in enumerate(legs, start=1):
+        lines.append(
+            f"| {idx} | {leg.start_name} -> {leg.end_name} | {leg.distance_m:.1f} | "
+            f"+{leg.elevation_gain_m:.1f} / -{leg.elevation_loss_m:.1f} | "
+            f"{leg.mean_slope_deg:.1f} / {leg.max_slope_deg:.1f} deg | "
+            f"{leg.steps_over_20deg} ({leg.steep_distance_over_20deg_m:.1f} m) | "
+            f"{leg.estimated_duration_min:.1f} | {leg.estimated_energy_kj:.1f} |"
+        )
+
+    lines.extend(
+        [
+            f"| **Total** | **Complete EVA Loop** | **{total_dist_m:.1f}** | **+{total_gain_m:.1f} / -{total_loss_m:.1f}** | **—** | **{total_steps_20} ({total_dist_20_m:.1f} m)** | **{total_time_min:.1f}** | **{total_energy_kj:.1f}** |",
+            "",
+            "## 3. Suit Contingency & Walkback Verification",
+            f"- **Walkback Check Status:** **{walkback_status}**",
+            f"- **Worst-Case Return Path:** {max_walkback_m:.1f} m (from `{furthest_stop}` back to Base)",
+            f"- **Maximum Allowed Walkback Limit:** {eva_config.max_walkback_distance_m:.1f} m",
+            "",
+            "## 4. Engineering Assumptions & Model Notes",
+            f"- **Suited Crew Parameters:** Assumes `{eva_config.astronaut_total_mass_kg:.0f} kg` total suited mass, `{eva_config.nominal_walk_speed_mps:.2f} m/s` flat-ground speed, and `{thresholds.no_go_slope_deg:.1f} deg` hard slope limit.",
+            "- **Metabolic Energy Model:** Combines horizontal suit locomotion (`2.8 J/kg/m`) with positive gravitational climb work (`m * g_mars * max(0, dz) / 0.25`). Downhill segments (`dz < 0`) contribute zero climb work in this baseline, accounting for lower energy on downhill return legs.",
+            "- **Rock Protrusion Index:** Computed via positive 3x3 Topographic Position Index (height above the 8-neighbor mean), measuring local crest prominence rather than true base-to-peak rock height.",
+            "",
+            "## 5. Generated Pipeline Artifacts",
+        ]
+    )
+
+    for label, path in artifact_paths.items():
+        lines.append(f"- **{label}:** `{path.name}`")
+
+    report_text = "\n".join(lines) + "\n"
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report_text)
+
+    return report_text
+
+
+# ==============================================================================
+# CLI ARGUMENT PARSING & ORCHESTRATION
+# ==============================================================================
+def parse_cli_args() -> argparse.Namespace:
+    """Parses command-line arguments for the Martian EVA pipeline."""
+    parser = argparse.ArgumentParser(
+        description="End-to-end Martian Terrain Hazard Mapper & EVA Route Planner CLI."
+    )
+
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument(
+        "--geotiff",
+        type=str,
+        help="Path to a calibrated metric HiRISE DTM GeoTIFF (e.g., DTEEC_*.tif).",
+    )
+    source_group.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="Generate and run on the labeled synthetic Mount Sharp test layout.",
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="eva_output",
+        help="Directory where all hazard layers, routes, plots, and reports are saved.",
+    )
+    parser.add_argument(
+        "--waypoints",
+        type=str,
+        default=None,
+        help="Optional path to a JSON file defining custom mission waypoints.",
+    )
+    parser.add_argument(
+        "--no-go-slope",
+        type=float,
+        default=22.0,
+        help="Hard slope cutoff in degrees for No-Go terrain (default: 22.0).",
+    )
+    parser.add_argument(
+        "--max-walkback",
+        type=float,
+        default=1500.0,
+        help="Maximum allowable return-to-base walkback distance in meters (default: 1500.0).",
+    )
+    parser.add_argument(
+        "--despike-seams",
+        action="store_true",
+        help="Apply a 3x3 median filter to suppress HiRISE stereo patch seam artifacts.",
+    )
+    parser.add_argument(
+        "--synthetic-rows",
+        type=int,
+        default=350,
+        help="Row count for synthetic DEM grid (default: 350).",
+    )
+    parser.add_argument(
+        "--synthetic-cols",
+        type=int,
+        default=450,
+        help="Column count for synthetic DEM grid (default: 450).",
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    """Executes the full hazard-mapping, routing, and reporting pipeline."""
+    t_start = time.perf_counter()
+    args = parse_cli_args()
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    logger = setup_pipeline_logger(out_dir / "pipeline.log")
+
+    # Define standardized output artifact paths
+    artifacts = {
+        "Hazard Layers Archive (.npz)": out_dir / "hazard_layers.npz",
+        "Hazard Audit Manifest (.json)": out_dir / "hazard_manifest.json",
+        "Terrain & Hazard Map (.png)": out_dir / "terrain_hazard_map.png",
+        "EVA Route GeoJSON (.geojson)": out_dir / "eva_route.geojson",
+        "Route-on-Hazard Plot (.png)": out_dir / "eva_route_preview.png",
+        "Mission Summary Report (.md)": out_dir / "eva_mission_report.md",
+    }
+
+    try:
+        logger.info("=== STARTING MARTIAN EVA PIPELINE (Output Dir: %s) ===", out_dir.resolve())
+
+        # Step 1: Build Single-Source-of-Truth Terrain & Hazard Layers
+        thresholds = HazardThresholds(
+            no_go_slope_deg=args.no_go_slope,
+            despike_hirise_seams=args.despike_seams,
+        )
+        mapper = TerrainHazardMapper(thresholds=thresholds)
+
+        if args.geotiff:
+            hazard_product = mapper.build_from_geotiff(args.geotiff)
+        else:
+            hazard_product = mapper.build_synthetic_mount_sharp(
+                rows=args.synthetic_rows, cols=args.synthetic_cols
+            )
+
+        save_hazard_artifacts(
+            product=hazard_product,
+            thresholds=thresholds,
+            npz_path=str(artifacts["Hazard Layers Archive (.npz)"]),
+            manifest_path=str(artifacts["Hazard Audit Manifest (.json)"]),
+        )
+        save_hazard_preview(
+            product=hazard_product,
+            output_png=str(artifacts["Terrain & Hazard Map (.png)"]),
+        )
+
+        # Step 2: Load Precomputed Hazard Surface & Solve EVA Route
+        hazard_surface = PrecomputedHazardSurface.from_npz(
+            str(artifacts["Hazard Layers Archive (.npz)"])
+        )
+        eva_config = EVACostConfig(
+            max_passable_slope_deg=args.no_go_slope,
+            max_walkback_distance_m=args.max_walkback,
+        )
+        waypoints = load_waypoints(args.waypoints, logger)
+
+        router = MartianEVARouter(surface=hazard_surface, config=eva_config)
+        solved_legs = router.plan_mission(waypoints)
+        max_walkback_m, furthest_stop = evaluate_walkback_contingency(
+            router=router, waypoints=waypoints, solved_legs=solved_legs
+        )
+
+        export_mission_geojson(
+            legs=solved_legs,
+            surface=hazard_surface,
+            output_path=str(artifacts["EVA Route GeoJSON (.geojson)"]),
+        )
+        save_route_preview(
+            surface=hazard_surface,
+            waypoints=waypoints,
+            legs=solved_legs,
+            output_png=str(artifacts["Route-on-Hazard Plot (.png)"]),
+        )
+
+        # Step 3: Write Markdown Summary Report & Print Console Overview
+        elapsed_sec = time.perf_counter() - t_start
+        report_md = write_mission_report(
+            report_path=artifacts["Mission Summary Report (.md)"],
+            hazard_product=hazard_product,
+            thresholds=thresholds,
+            eva_config=eva_config,
+            legs=solved_legs,
+            max_walkback_m=max_walkback_m,
+            furthest_stop=furthest_stop,
+            elapsed_sec=elapsed_sec,
+            artifact_paths=artifacts,
+        )
+
+        logger.info("=== PIPELINE COMPLETE IN %.2f s ===", elapsed_sec)
+        print("\n" + "=" * 72)
+        print(report_md.strip())
+        print("=" * 72 + "\n")
+
+    except Exception as exc:
+        logger.exception("Pipeline execution failed: %s", exc)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
