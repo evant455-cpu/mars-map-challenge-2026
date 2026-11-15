@@ -1,0 +1,799 @@
+#!/usr/bin/env python3
+"""Astronaut Safety Layer Generator (Time-to-Safety, Walkback, LoS & Climb Warnings).
+
+Consumes the single-source-of-truth terrain/hazard archive (`hazard_layers.npz`)
+and solved EVA traverse (`eva_route.geojson`) to compute operational crew safety
+layers and mission timeline metrics:
+    1. Time-to-Safety Map (`time_to_base_sec`): Runs a single Reverse Dijkstra
+       search outward from the HAB/Lander Base across all passable cells, using
+       directional return walking speed (`step_dist / walk_speed(slope_to_base)`).
+    2. Point-by-Point Apollo Walkback Check: Verifies at every point along the
+       planned route that:
+           time_used_so_far + time_to_base[point] + reserve <= EVA_time_budget
+       and flags any failing point in red.
+    3. Mission Timeline & Radiation Metrics: Computes midday EVA schedule
+       (`12:00 LMST`), 30-minute walkback reserve, Curiosity RAD surface dose
+       (`hours * 0.67 / 24` mSv), worst-case Time-to-Shelter (`max time_to_base`
+       along route), and Gale Crater midday temperature guidance.
+    4. Line of Sight (LoS) to Base: Ray-marches every route point to the Base
+       (`1.7 m` astronaut eye height to `3.0 m` Base mast height) to highlight
+       visually occluded segments.
+    5. Sustained-Climb Warnings: Scans the route for stretches climbing > 5.0 m
+       within 50.0 m of walking distance and places Planned Rest Stop markers.
+
+Outputs:
+    - `safety_layers.npz`: Grid-wide `time_to_base_sec` + per-route safety arrays.
+    - `safety_report.json`: Structured mission timeline, radiation, LoS & rest stops.
+    - `astronaut_safety_preview.png`: Diagnostic map of Time-to-Safety & route flags.
+
+Example:
+    Run after terrain_hazard_mapper.py and martian_eva_router.py, in the same folder:
+        $ python3 astronaut_safety_layer.py
+"""
+
+import argparse
+from dataclasses import asdict, dataclass
+import heapq
+import json
+import logging
+from pathlib import Path
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+import numpy as np
+
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
+
+# ==============================================================================
+# LOGGING CONFIGURATION (MOBILE-FRIENDLY TERMINAL & FILE TELEMETRY)
+# ==============================================================================
+def setup_safety_logger(log_path: Path, level: int = logging.INFO) -> logging.Logger:
+    """Configures a dual-output logger for terminal and mobile SSH inspection.
+
+    Args:
+        log_path: Destination file path for persistent safety execution logs.
+        level: Logging severity threshold.
+
+    Returns:
+        Configured logging.Logger instance.
+    """
+    logger = logging.getLogger("AstronautSafetyLayer")
+    logger.setLevel(level)
+
+    if logger.handlers:
+        logger.handlers.clear()
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-7s | %(funcName)s:%(lineno)d | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    return logger
+
+
+# ==============================================================================
+# SAFETY CONFIGURATION & ENGINEERING ASSUMPTIONS
+# ==============================================================================
+# Curiosity RAD average Mars surface GCR dose rate (~0.67 mSv/day)
+MARS_SURFACE_RAD_MSV_PER_DAY: float = 0.67
+
+# Exact Gale Crater environmental guidance (not modeled spatially)
+GALE_TEMPERATURE_NOTE: str = (
+    "Plan EVAs around midday; Curiosity measured daily air highs near 0°C "
+    "and lows near −70°C in late winter–spring."
+)
+
+
+@dataclass
+class AstronautSafetyConfig:
+    """Mission safety thresholds and physiological/hardware assumptions.
+
+    Note:
+        All parameters below are baseline engineering assumptions and are
+        explicitly tagged as assumptions in outputs and viewer panels.
+
+    Attributes:
+        eva_start_time_lmst: [ASSUMPTION] Midday EVA egress start time (Local Mean Solar Time).
+        eva_time_budget_min: [ASSUMPTION] Total allowable EVA life-support budget (minutes).
+        walkback_reserve_min: [ASSUMPTION] Mandatory Apollo-style contingency reserve (minutes).
+        nominal_walk_speed_mps: [ASSUMPTION] Flat-ground suited walking speed (m/s).
+        max_passable_slope_deg: [ASSUMPTION] Maximum passable step slope (deg).
+        astronaut_eye_height_m: [ASSUMPTION] Suited astronaut eye height above terrain (m).
+        base_mast_height_m: [ASSUMPTION] HAB/Lander visual beacon/antenna mast height (m).
+        climb_window_m: [ASSUMPTION] Sliding walking window for sustained-climb checks (m).
+        climb_threshold_m: [ASSUMPTION] Cumulative climb within `climb_window_m` triggering
+            a Planned Rest Stop warning (m).
+    """
+    eva_start_time_lmst: str = "12:00 LMST"
+    eva_time_budget_min: float = 60.0
+    walkback_reserve_min: float = 30.0
+    nominal_walk_speed_mps: float = 0.85
+    max_passable_slope_deg: float = 22.0
+    astronaut_eye_height_m: float = 1.7
+    base_mast_height_m: float = 3.0
+    climb_window_m: float = 50.0
+    climb_threshold_m: float = 5.0
+
+
+# ==============================================================================
+# LOCOMOTION SPEED MODEL (MATCHES MARTIAN_EVA_ROUTER.PY)
+# ==============================================================================
+def step_walk_speed_mps(
+    signed_slope_deg: float, roughness_m: float, nominal_speed_mps: float = 0.85
+) -> float:
+    """Computes directional astronaut walking speed (m/s) for a single step.
+
+    Uses the Tobler-inspired pressurized suit velocity curve shared with
+    `MartianEVARouter`: peak speed occurs on gentle -3 deg downslopes, slowing
+    on steep climbs, steep braking descents, and high micro-roughness terrain.
+
+    Args:
+        signed_slope_deg: Directional slope in degrees (+ uphill, - downhill).
+        roughness_m: Local 3x3 Terrain Ruggedness Index at destination cell (m).
+        nominal_speed_mps: Flat-ground walking speed (m/s).
+
+    Returns:
+        Effective walking speed in meters per second (clamped >= 0.25 m/s).
+    """
+    slope_penalty = np.exp(-2.8 * abs(np.radians(signed_slope_deg + 3.0)))
+    rough_penalty = max(0.45, 1.0 - 0.5 * (roughness_m / 0.85))
+    speed = nominal_speed_mps * slope_penalty * rough_penalty
+    return float(max(0.25, speed))
+
+
+# ==============================================================================
+# STEP 1: REVERSE DIJKSTRA "TIME TO SAFETY" MAP
+# ==============================================================================
+def compute_time_to_base_grid(
+    dem: np.ndarray,
+    roughness_tri_m: np.ndarray,
+    no_go_mask: np.ndarray,
+    base_rc: Tuple[int, int],
+    resolution_m: float,
+    config: AstronautSafetyConfig,
+    logger: logging.Logger,
+) -> np.ndarray:
+    """Computes minimum return walking time (seconds) to Base from every map cell.
+
+    Runs a single Reverse Dijkstra expansion starting at `base_rc`. For each
+    edge `(cell -> neighbor)`, evaluates the return trip walking FROM `neighbor`
+    TO `cell` using the directional return slope `dem[cell] - dem[neighbor]`.
+
+    Args:
+        dem: 2D float64 elevation array (meters).
+        roughness_tri_m: 2D float64 3x3 Terrain Ruggedness Index array (meters).
+        no_go_mask: 2D boolean mask where True indicates impassable terrain.
+        base_rc: `(row, col)` grid coordinate of the HAB/Lander Base.
+        resolution_m: Spatial resolution in meters/pixel.
+        config: AstronautSafetyConfig containing speed and slope limits.
+        logger: Active logger instance.
+
+    Returns:
+        2D float64 array `time_to_base_sec` (`0.0` at Base, `np.inf` on No-Go/unreachable).
+
+    Raises:
+        ValueError: If `base_rc` is out of bounds or lies on No-Go terrain.
+    """
+    rows, cols = dem.shape
+    br, bc = base_rc
+    if not (0 <= br < rows and 0 <= bc < cols):
+        raise ValueError(f"Base coordinate {base_rc} is outside grid bounds ({rows}x{cols}).")
+    if no_go_mask[br, bc]:
+        raise ValueError(f"Base coordinate {base_rc} sits on No-Go terrain.")
+
+    logger.info("Running Reverse Dijkstra Time-to-Safety from Base (%d, %d)...", br, bc)
+
+    time_to_base = np.full((rows, cols), np.inf, dtype=np.float64)
+    time_to_base[br, bc] = 0.0
+
+    # 8-connected neighbor offsets: (d_row, d_col, planar_distance_multiplier)
+    neighbors: Tuple[Tuple[int, int, float], ...] = (
+        (-1, 0, 1.0),
+        (1, 0, 1.0),
+        (0, -1, 1.0),
+        (0, 1, 1.0),
+        (-1, -1, 1.41421356237),
+        (-1, 1, 1.41421356237),
+        (1, -1, 1.41421356237),
+        (1, 1, 1.41421356237),
+    )
+
+    heap: List[Tuple[float, Tuple[int, int]]] = [(0.0, (br, bc))]
+    settled_cells = 0
+
+    while heap:
+        t_curr, (r, c) = heapq.heappop(heap)
+
+        # Skip stale priority queue entries if a faster return route was already found
+        if t_curr > time_to_base[r, c]:
+            continue
+
+        settled_cells += 1
+        z_dest = dem[r, c]
+        rough_dest = float(roughness_tri_m[r, c])
+
+        for dr, dc, dist_mult in neighbors:
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < rows and 0 <= nc < cols):
+                continue
+            if no_go_mask[nr, nc]:
+                continue
+
+            z_origin = dem[nr, nc]
+            if np.isnan(z_origin) or np.isnan(z_dest):
+                continue
+
+            # Return trip walks FROM neighbor (nr, nc) TO cell (r, c)
+            planar_dist = dist_mult * resolution_m
+            dz_return = z_dest - z_origin
+            signed_slope_deg = float(np.degrees(np.arctan2(dz_return, planar_dist)))
+
+            if abs(signed_slope_deg) > config.max_passable_slope_deg:
+                continue
+
+            step_dist = float(np.hypot(planar_dist, dz_return))
+            speed_mps = step_walk_speed_mps(
+                signed_slope_deg=signed_slope_deg,
+                roughness_m=rough_dest,
+                nominal_speed_mps=config.nominal_walk_speed_mps,
+            )
+            step_time_sec = step_dist / speed_mps
+            candidate_t = t_curr + step_time_sec
+
+            if candidate_t < time_to_base[nr, nc]:
+                time_to_base[nr, nc] = candidate_t
+                heapq.heappush(heap, (candidate_t, (nr, nc)))
+
+    reachable_mask = np.isfinite(time_to_base)
+    reachable_pct = 100.0 * float(np.mean(reachable_mask))
+    max_reachable_min = float(np.nanmax(time_to_base[reachable_mask])) / 60.0 if np.any(reachable_mask) else 0.0
+
+    logger.info(
+        "Reverse Dijkstra complete | Settled %d cells | Reachable area: %.1f%% | Max grid return time: %.1f min",
+        settled_cells,
+        reachable_pct,
+        max_reachable_min,
+    )
+    return time_to_base
+
+
+# ==============================================================================
+# STEP 3: LINE OF SIGHT (LOS) RAY-MARCHING TO BASE
+# ==============================================================================
+def check_line_of_sight_to_base(
+    dem: np.ndarray,
+    point_rc: Tuple[int, int],
+    base_rc: Tuple[int, int],
+    eye_height_m: float,
+    mast_height_m: float,
+) -> bool:
+    """Checks whether the Base mast is visually unobstructed from a route point.
+
+    Steps along the 2D straight line from `point_rc` (at `dem + eye_height_m`)
+    to `base_rc` (at `dem + mast_height_m`) at ~0.5-pixel sub-steps. If any
+    intermediate terrain cell rises above the straight sightline, returns False.
+
+    Args:
+        dem: 2D float64 elevation array (meters).
+        point_rc: `(row, col)` coordinate of the astronaut on the route.
+        base_rc: `(row, col)` coordinate of the HAB/Lander Base.
+        eye_height_m: Astronaut eye height above local ground (m).
+        mast_height_m: Base visual mast height above local ground (m).
+
+    Returns:
+        True if line of sight to Base is unobstructed, False if terrain blocks view.
+    """
+    r0, c0 = point_rc
+    r1, c1 = base_rc
+    pixel_span = float(np.hypot(r1 - r0, c1 - c0))
+    if pixel_span < 1.0:
+        return True
+
+    z_eye = float(dem[r0, c0]) + eye_height_m
+    z_mast = float(dem[r1, c1]) + mast_height_m
+
+    # Sample at 0.5-pixel intervals so narrow 1 m boxwork ridges are never skipped
+    num_samples = max(2, int(np.ceil(pixel_span * 2.0)))
+    for step in range(1, num_samples):
+        frac = step / float(num_samples)
+        sr = int(round(r0 + frac * (r1 - r0)))
+        sc = int(round(c0 + frac * (c1 - c0)))
+        if (sr, sc) == (r0, c0) or (sr, sc) == (r1, c1):
+            continue
+
+        z_los = z_eye + frac * (z_mast - z_eye)
+        z_ground = float(dem[sr, sc])
+        if z_ground > z_los:
+            return False
+
+    return True
+
+
+# ==============================================================================
+# STEP 2 & 4: FULL ROUTE SAFETY EVALUATION (WALKBACK, RADIATION, LOS & CLIMBS)
+# ==============================================================================
+def evaluate_route_safety(
+    dem: np.ndarray,
+    roughness_tri_m: np.ndarray,
+    time_to_base_sec: np.ndarray,
+    geojson_data: Dict[str, Any],
+    base_rc: Tuple[int, int],
+    resolution_m: float,
+    config: AstronautSafetyConfig,
+    logger: logging.Logger,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+    """Evaluates Apollo walkback limits, radiation dose, LoS, and sustained climbs.
+
+    Args:
+        dem: 2D float64 elevation array (meters).
+        roughness_tri_m: 2D float64 3x3 TRI roughness array (meters).
+        time_to_base_sec: 2D float64 Reverse Dijkstra return time grid (seconds).
+        geojson_data: Parsed `eva_route.geojson` FeatureCollection.
+        base_rc: `(row, col)` Base coordinate.
+        resolution_m: Spatial pixel spacing in meters.
+        config: AstronautSafetyConfig thresholds and assumptions.
+        logger: Active logger instance.
+
+    Returns:
+        Tuple of `(route_arrays_dict, safety_report_dict)`.
+    """
+    route_rows: List[int] = []
+    route_cols: List[int] = []
+    leg_numbers: List[int] = []
+
+    for feat in geojson_data.get("features", []):
+        props = feat.get("properties", {})
+        leg_num = int(props.get("leg_number", 1))
+        coords = props.get("grid_pixel_coords", [])
+        for idx, (c_val, r_val) in enumerate(coords):
+            # Avoid duplicating shared junction vertices between consecutive legs
+            if route_rows and idx == 0 and route_rows[-1] == int(r_val) and route_cols[-1] == int(c_val):
+                continue
+            route_rows.append(int(r_val))
+            route_cols.append(int(c_val))
+            leg_numbers.append(leg_num)
+
+    if len(route_rows) < 2:
+        raise ValueError("Route GeoJSON contains fewer than 2 vertices to evaluate.")
+
+    n_pts = len(route_rows)
+    cum_dist_m = np.zeros(n_pts, dtype=np.float64)
+    cum_climb_m = np.zeros(n_pts, dtype=np.float64)
+    time_used_sec = np.zeros(n_pts, dtype=np.float64)
+    point_time_to_base_sec = np.zeros(n_pts, dtype=np.float64)
+    walkback_violation = np.zeros(n_pts, dtype=bool)
+    los_visible = np.ones(n_pts, dtype=bool)
+    sustained_climb_mask = np.zeros(n_pts, dtype=bool)
+
+    reserve_sec = config.walkback_reserve_min * 60.0
+    budget_sec = config.eva_time_budget_min * 60.0
+
+    # 1. Integrate forward time, distance, climb, walkback margin, and Line of Sight
+    for i in range(n_pts):
+        r, c = route_rows[i], route_cols[i]
+        if i > 0:
+            pr, pc = route_rows[i - 1], route_cols[i - 1]
+            planar_dist = float(np.hypot(r - pr, c - pc)) * resolution_m
+            dz = float(dem[r, c] - dem[pr, pc])
+            step_dist = float(np.hypot(planar_dist, dz))
+            signed_slope = float(np.degrees(np.arctan2(dz, planar_dist)))
+            speed = step_walk_speed_mps(
+                signed_slope_deg=signed_slope,
+                roughness_m=float(roughness_tri_m[r, c]),
+                nominal_speed_mps=config.nominal_walk_speed_mps,
+            )
+            cum_dist_m[i] = cum_dist_m[i - 1] + step_dist
+            cum_climb_m[i] = cum_climb_m[i - 1] + max(0.0, dz)
+            time_used_sec[i] = time_used_sec[i - 1] + (step_dist / speed)
+
+        ttb = float(time_to_base_sec[r, c])
+        point_time_to_base_sec[i] = ttb
+
+        # Apollo walkback rule: time_used_so_far + time_to_base[point] + reserve <= budget
+        total_projected_sec = time_used_sec[i] + ttb + reserve_sec
+        walkback_violation[i] = bool(np.isinf(ttb) or (total_projected_sec > budget_sec))
+
+        # Step 3: Visual Line of Sight to Base mast
+        los_visible[i] = check_line_of_sight_to_base(
+            dem=dem,
+            point_rc=(r, c),
+            base_rc=base_rc,
+            eye_height_m=config.astronaut_eye_height_m,
+            mast_height_m=config.base_mast_height_m,
+        )
+
+    # 2. Step 4: Sustained-Climb sliding window check (>5 m climb within 50 m walking)
+    for i in range(n_pts):
+        j = i
+        while j + 1 < n_pts and (cum_dist_m[j + 1] - cum_dist_m[i]) <= config.climb_window_m:
+            j += 1
+        if j > i:
+            window_climb = cum_climb_m[j] - cum_climb_m[i]
+            if window_climb >= config.climb_threshold_m:
+                sustained_climb_mask[i : j + 1] = True
+
+    # Group contiguous sustained-climb segments into Planned Rest Stops
+    rest_stops: List[Dict[str, Any]] = []
+    idx = 0
+    while idx < n_pts:
+        if sustained_climb_mask[idx]:
+            start_idx = idx
+            while idx + 1 < n_pts and sustained_climb_mask[idx + 1]:
+                idx += 1
+            end_idx = idx
+            # Place Planned Rest Stop at the top/crest of the sustained climb
+            crest_r, crest_c = route_rows[end_idx], route_cols[end_idx]
+            seg_dist = float(cum_dist_m[end_idx] - cum_dist_m[start_idx])
+            seg_climb = float(cum_climb_m[end_idx] - cum_climb_m[start_idx])
+            rest_stops.append(
+                {
+                    "stop_id": len(rest_stops) + 1,
+                    "label": f"Planned Rest Stop #{len(rest_stops) + 1}",
+                    "row": int(crest_r),
+                    "col": int(crest_c),
+                    "route_distance_m": round(float(cum_dist_m[end_idx]), 1),
+                    "segment_length_m": round(seg_dist, 1),
+                    "cumulative_climb_m": round(seg_climb, 2),
+                    "elevation_m": round(float(dem[crest_r, crest_c]), 2),
+                }
+            )
+        idx += 1
+
+    # 3. Step 2: Mission Timeline, Radiation Dose & Worst-Case Time to Shelter
+    total_eva_min = float(time_used_sec[-1]) / 60.0
+    total_eva_hours = total_eva_min / 60.0
+    radiation_dose_msv = total_eva_hours * (MARS_SURFACE_RAD_MSV_PER_DAY / 24.0)
+
+    finite_ttb = point_time_to_base_sec[np.isfinite(point_time_to_base_sec)]
+    if finite_ttb.size > 0:
+        worst_idx = int(np.argmax(np.where(np.isfinite(point_time_to_base_sec), point_time_to_base_sec, -1.0)))
+        worst_shelter_sec = float(point_time_to_base_sec[worst_idx])
+        worst_shelter_rc = [int(route_rows[worst_idx]), int(route_cols[worst_idx])]
+        worst_shelter_dist_m = float(cum_dist_m[worst_idx])
+    else:
+        worst_shelter_sec = float("inf")
+        worst_shelter_rc = [int(route_rows[0]), int(route_cols[0])]
+        worst_shelter_dist_m = 0.0
+
+    # Compute estimated arrival time in LMST (e.g., 12:00 + 23 min -> 12:23 LMST)
+    start_hour, start_min = map(int, config.eva_start_time_lmst.split()[0].split(":"))
+    end_total_min = start_hour * 60 + start_min + int(round(total_eva_min))
+    end_time_lmst = f"{(end_total_min // 60) % 24:02d}:{end_total_min % 60:02d} LMST"
+
+    violation_count = int(np.sum(walkback_violation))
+    min_margin_sec = float(np.min(budget_sec - (time_used_sec + point_time_to_base_sec + reserve_sec)))
+    los_visible_pct = 100.0 * float(np.mean(los_visible))
+
+    logger.info(
+        "Route Safety Audit | Total EVA: %.1f min | Worst Time-to-Shelter: %.1f min at (%d,%d) | "
+        "Walkback Violations: %d pts (min margin=%.1f min) | LoS Visible: %.1f%% | Rest Stops: %d",
+        total_eva_min,
+        worst_shelter_sec / 60.0,
+        worst_shelter_rc[0],
+        worst_shelter_rc[1],
+        violation_count,
+        min_margin_sec / 60.0,
+        los_visible_pct,
+        len(rest_stops),
+    )
+
+    route_arrays = {
+        "route_rows": np.array(route_rows, dtype=np.int32),
+        "route_cols": np.array(route_cols, dtype=np.int32),
+        "leg_numbers": np.array(leg_numbers, dtype=np.int32),
+        "cum_dist_m": cum_dist_m,
+        "time_used_sec": time_used_sec,
+        "point_time_to_base_sec": point_time_to_base_sec,
+        "walkback_violation": walkback_violation,
+        "los_visible": los_visible,
+        "sustained_climb_mask": sustained_climb_mask,
+    }
+
+    report: Dict[str, Any] = {
+        "timeline": {
+            "eva_start_time_lmst": config.eva_start_time_lmst,
+            "eva_end_time_lmst": end_time_lmst,
+            "total_walking_time_min": round(total_eva_min, 2),
+            "walkback_reserve_min": round(config.walkback_reserve_min, 1),
+            "eva_time_budget_min": round(config.eva_time_budget_min, 1),
+            "apollo_walkback_pass": violation_count == 0,
+            "walkback_violation_points": violation_count,
+            "minimum_reserve_margin_min": round(min_margin_sec / 60.0, 2),
+        },
+        "radiation_and_shelter": {
+            "routine_radiation_dose_msv": round(radiation_dose_msv, 4),
+            "radiation_formula": "eva_hours * (0.67 mSv/day / 24)",
+            "radiation_guidance": (
+                f"Routine walking dose is tiny (~{radiation_dose_msv:.2f} mSv); "
+                "the real radiation risk is a sudden solar storm."
+            ),
+            "worst_case_time_to_shelter_min": round(worst_shelter_sec / 60.0, 2),
+            "worst_case_time_to_shelter_sec": round(worst_shelter_sec, 1),
+            "worst_case_shelter_grid_rc": worst_shelter_rc,
+            "worst_case_shelter_route_dist_m": round(worst_shelter_dist_m, 1),
+        },
+        "line_of_sight": {
+            "visible_percent": round(los_visible_pct, 1),
+            "occluded_points": int(np.sum(~los_visible)),
+            "total_route_points": n_pts,
+            "assumptions": (
+                f"Geometric line of sight from {config.astronaut_eye_height_m:.1f} m "
+                f"astronaut eye height to {config.base_mast_height_m:.1f} m Base mast."
+            ),
+        },
+        "sustained_climbs": {
+            "planned_rest_stop_count": len(rest_stops),
+            "rest_stops": rest_stops,
+            "assumptions": (
+                f"Flags stretches climbing > {config.climb_threshold_m:.1f} m within "
+                f"{config.climb_window_m:.1f} m of walking distance."
+            ),
+        },
+        "temperature_guidance": GALE_TEMPERATURE_NOTE,
+        "base_grid_rc": [int(base_rc[0]), int(base_rc[1])],
+        "assumptions": asdict(config),
+    }
+
+    return route_arrays, report
+
+
+# ==============================================================================
+# DIAGNOSTIC PREVIEW PLOTTER
+# ==============================================================================
+def save_safety_preview(
+    time_to_base_sec: np.ndarray,
+    no_go_mask: np.ndarray,
+    route_arrays: Dict[str, np.ndarray],
+    report: Dict[str, Any],
+    output_png: Path,
+    logger: logging.Logger,
+) -> None:
+    """Saves a 2-panel diagnostic plot of the Time-to-Safety map & route safety overlays."""
+    if not HAS_MATPLOTLIB:
+        logger.warning("matplotlib not installed; skipping safety preview PNG.")
+        return
+
+    ttb_min = np.where(np.isfinite(time_to_base_sec), time_to_base_sec / 60.0, np.nan)
+    cmap = plt.cm.RdYlGn_r.copy()
+    cmap.set_bad(color="#111827")
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6), dpi=150)
+
+    # Panel 1: Full-grid Time-to-Safety (minutes back to Base)
+    im0 = axes[0].imshow(ttb_min, cmap=cmap, origin="upper")
+    br, bc = report["base_grid_rc"]
+    axes[0].scatter([bc], [br], c="#38bdf8", edgecolors="black", s=80, zorder=5, label="HAB / Base")
+    axes[0].set_title("Time-to-Safety Map (Walking Minutes Back to Base)")
+    axes[0].set_xlabel("East-West (m)")
+    axes[0].set_ylabel("North-South (m)")
+    axes[0].legend(loc="lower left", fontsize=8)
+    fig.colorbar(im0, ax=axes[0], shrink=0.8, label="Return Time to Base (min)")
+
+    # Panel 2: Route Safety Overlays (Walkback Violations, Out-of-Sight, Rest Stops)
+    axes[1].imshow(ttb_min, cmap=cmap, alpha=0.65, origin="upper")
+    r_pts = route_arrays["route_rows"]
+    c_pts = route_arrays["route_cols"]
+    axes[1].plot(c_pts, r_pts, color="#38bdf8", linewidth=2.0, label="Nominal Safe Route")
+
+    # Highlight Out-of-Sight points
+    oos_mask = ~route_arrays["los_visible"]
+    if np.any(oos_mask):
+        axes[1].scatter(
+            c_pts[oos_mask],
+            r_pts[oos_mask],
+            c="#f59e0b",
+            s=14,
+            zorder=4,
+            label="Out of Line-of-Sight to Base",
+        )
+
+    # Highlight Apollo Walkback Rule Failures in Red
+    fail_mask = route_arrays["walkback_violation"]
+    if np.any(fail_mask):
+        axes[1].scatter(
+            c_pts[fail_mask],
+            r_pts[fail_mask],
+            c="#ef4444",
+            s=22,
+            zorder=5,
+            label="Apollo Walkback Rule FAIL",
+        )
+
+    # Mark Planned Rest Stops
+    for stop in report["sustained_climbs"]["rest_stops"]:
+        axes[1].scatter(
+            [stop["col"]],
+            [stop["row"]],
+            marker="^",
+            c="#ffffff",
+            edgecolors="#000000",
+            s=75,
+            zorder=6,
+        )
+        axes[1].annotate(
+            stop["label"],
+            (stop["col"] + 4, stop["row"] - 4),
+            color="white",
+            fontsize=7.5,
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.75),
+        )
+
+    axes[1].set_title("Apollo Walkback, Line-of-Sight & Climb Rest Stops")
+    axes[1].set_xlabel("East-West (m)")
+    axes[1].legend(loc="lower left", fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(output_png)
+    plt.close(fig)
+    logger.info("Saved astronaut safety diagnostic PNG to %s", output_png)
+
+
+# ==============================================================================
+# ORCHESTRATOR & CLI ENTRY POINT
+# ==============================================================================
+def build_astronaut_safety_layers(
+    input_dir: Path, config: AstronautSafetyConfig, logger: logging.Logger
+) -> Dict[str, Any]:
+    """Loads `hazard_layers.npz` and `eva_route.geojson`, builds `safety_layers.npz`."""
+    npz_path = input_dir / "hazard_layers.npz"
+    geojson_path = input_dir / "eva_route.geojson"
+
+    for req in (npz_path, geojson_path):
+        if not req.exists():
+            raise FileNotFoundError(
+                f"Required input '{req}' not found. Run `python3 terrain_hazard_mapper.py` "
+                "and then `python3 martian_eva_router.py` in that folder first."
+            )
+
+    with np.load(npz_path, allow_pickle=False) as data:
+        dem = data["dem"].astype(np.float64)
+        roughness_tri_m = data["roughness_tri_m"].astype(np.float64)
+        no_go_mask = data["no_go_mask"].astype(bool)
+        resolution_m = float(data["resolution_m"][0])
+        if "no_go_slope_deg" in data:
+            config.max_passable_slope_deg = float(data["no_go_slope_deg"][0])
+
+    with open(geojson_path, "r", encoding="utf-8") as f:
+        geojson_data = json.load(f)
+
+    # Extract Base (row, col) from the origin of Leg 1
+    first_coords = geojson_data["features"][0]["properties"]["grid_pixel_coords"][0]
+    base_rc = (int(first_coords[1]), int(first_coords[0]))
+
+    # Step 1: Reverse Dijkstra Time-to-Safety map across entire grid
+    time_to_base_sec = compute_time_to_base_grid(
+        dem=dem,
+        roughness_tri_m=roughness_tri_m,
+        no_go_mask=no_go_mask,
+        base_rc=base_rc,
+        resolution_m=resolution_m,
+        config=config,
+        logger=logger,
+    )
+
+    # Steps 2-4: Evaluate route walkback margins, timeline, LoS & sustained climbs
+    route_arrays, report = evaluate_route_safety(
+        dem=dem,
+        roughness_tri_m=roughness_tri_m,
+        time_to_base_sec=time_to_base_sec,
+        geojson_data=geojson_data,
+        base_rc=base_rc,
+        resolution_m=resolution_m,
+        config=config,
+        logger=logger,
+    )
+
+    safety_npz_path = input_dir / "safety_layers.npz"
+    np.savez_compressed(
+        safety_npz_path,
+        time_to_base_sec=time_to_base_sec,
+        base_rc=np.array(base_rc, dtype=np.int32),
+        **route_arrays,
+    )
+    logger.info("Saved safety layers archive to %s", safety_npz_path)
+
+    safety_report_path = input_dir / "safety_report.json"
+    with open(safety_report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    logger.info("Saved astronaut safety report to %s", safety_report_path)
+
+    save_safety_preview(
+        time_to_base_sec=time_to_base_sec,
+        no_go_mask=no_go_mask,
+        route_arrays=route_arrays,
+        report=report,
+        output_png=input_dir / "astronaut_safety_preview.png",
+        logger=logger,
+    )
+
+    return report
+
+
+def main() -> None:
+    """CLI entry point for generating the Astronaut Safety Layer."""
+    parser = argparse.ArgumentParser(
+        description="Compute Reverse Dijkstra Time-to-Safety, Apollo Walkback, LoS & Climb Rest Stops."
+    )
+    parser.add_argument(
+        "--input-dir",
+        type=str,
+        default=".",
+        help="Directory containing hazard_layers.npz and eva_route.geojson.",
+    )
+    parser.add_argument(
+        "--eva-budget-min",
+        type=float,
+        default=60.0,
+        help="[ASSUMPTION] Total EVA time budget in minutes (default: 60.0).",
+    )
+    parser.add_argument(
+        "--reserve-min",
+        type=float,
+        default=30.0,
+        help="[ASSUMPTION] Apollo walkback contingency reserve in minutes (default: 30.0).",
+    )
+    parser.add_argument(
+        "--eye-height",
+        type=float,
+        default=1.7,
+        help="[ASSUMPTION] Astronaut eye height in meters (default: 1.7).",
+    )
+    parser.add_argument(
+        "--mast-height",
+        type=float,
+        default=3.0,
+        help="[ASSUMPTION] Base visual mast height in meters (default: 3.0).",
+    )
+    parser.add_argument(
+        "--climb-window",
+        type=float,
+        default=50.0,
+        help="[ASSUMPTION] Walking distance window in meters for sustained-climb check (default: 50.0).",
+    )
+    parser.add_argument(
+        "--climb-threshold",
+        type=float,
+        default=5.0,
+        help="[ASSUMPTION] Cumulative climb in meters within window to trigger rest stop (default: 5.0).",
+    )
+    args = parser.parse_args()
+
+    in_dir = Path(args.input_dir)
+    logger = setup_safety_logger(in_dir / "safety_layer.log")
+
+    cfg = AstronautSafetyConfig(
+        eva_time_budget_min=args.eva_budget_min,
+        walkback_reserve_min=args.reserve_min,
+        astronaut_eye_height_m=args.eye_height,
+        base_mast_height_m=args.mast_height,
+        climb_window_m=args.climb_window,
+        climb_threshold_m=args.climb_threshold,
+    )
+
+    try:
+        report = build_astronaut_safety_layers(input_dir=in_dir, config=cfg, logger=logger)
+        print("\n" + "=" * 72)
+        print("ASTRONAUT SAFETY & MISSION TIMELINE SUMMARY")
+        print("=" * 72)
+        print(json.dumps(report, indent=2))
+        print("=" * 72 + "\n")
+    except Exception as exc:
+        logger.exception("Astronaut Safety Layer failed: %s", exc)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

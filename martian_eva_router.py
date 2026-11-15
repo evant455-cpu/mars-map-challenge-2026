@@ -781,12 +781,16 @@ if __name__ == "__main__":
             max_walkback_distance_m=1500.0,
         )
 
-        # 3. Solve dual-target EVA loop
+        # 3. Solve dual-target EVA loop on the real HiRISE clip
+        #    (DTEEC_001488_1750_001752_1750_U02, rows 4550-5049, cols 4850-5349).
+        #    Row/col are positions INSIDE the 500x500 clip, not the full DTM.
+        #    Each was picked as the flattest tier-0 spot in the clip's largest
+        #    connected walkable area.
         mission_waypoints = [
-            Waypoint(name="HAB / Rover Base", row=45, col=60, science_priority="BASE"),
-            Waypoint(name="Boxwork Vein Node", row=195, col=180, science_priority="PRIMARY"),
-            Waypoint(name="Gediz Sulfur Rim", row=255, col=298, science_priority="ANOMALY"),
-            Waypoint(name="HAB / Rover Base", row=45, col=60, science_priority="BASE"),
+            Waypoint(name="HAB / Base", row=169, col=361, science_priority="BASE"),
+            Waypoint(name="Stop A (center)", row=319, col=224, science_priority="PRIMARY"),
+            Waypoint(name="Stop B (southeast)", row=393, col=449, science_priority="PRIMARY"),
+            Waypoint(name="HAB / Base", row=169, col=361, science_priority="BASE"),
         ]
 
         router = MartianEVARouter(surface=hazard_surface, config=eva_config)
