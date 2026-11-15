@@ -1,17 +1,17 @@
 # Martian EVA Route & Hazard Mapping Engine (Gale Crater)
 
 **NASA Space Apps Challenge 2026 — Martian Map challenge**
-Team: Tycho Engineering (solo) · Local Event: Cleveland, MS
+Team: Southern Astronomy (solo) · Local Event: Cleveland, MS
 
 This is a tool for planning a walk on Mars (an EVA, aka extravehicular activity). You give it elevation data, and it figures out where the ground is too steep or too rough, plans a route between science stops, then checks every step of that walk against the same walkback rule Apollo crews used on the Moon. It all ends up in one interactive map you open in your browser.
 
-> **Project status:** The current demo runs on a **synthetic terrain layout** that imitates features of lower Mount Sharp. Real HiRISE elevation data for the target sites has **not yet been confirmed or loaded**. The code can read a real HiRISE DTM GeoTIFF, but that path has not been tested on real data.
+> **Project status:** The main demo runs on **real NASA terrain**: a 500 m × 500 m patch of a HiRISE elevation model on the north edge of Mount Sharp. A second, **synthetic** layout is kept for testing. The real patch is real Mount Sharp ground, but I did **not** confirm boxwork or Gediz Vallis inside it.
 
 ---
 
 ## 1. Science targets
 
-The planned EVA visits two features that NASA's Curiosity rover has studied on Mount Sharp (Aeolis Mons) in Gale Crater.
+The route planner was designed around two features that NASA's Curiosity rover has studied on Mount Sharp (Aeolis Mons) in Gale Crater.
 
 ### Primary: Mount Sharp boxwork
 - Boxwork is a network of low ridges, roughly 1–2 m tall, with sandy hollows between them, on the slopes of Mount Sharp. [1]
@@ -29,43 +29,68 @@ The planned EVA visits two features that NASA's Curiosity rover has studied on M
 - **Hottah and Link (near Curiosity's landing site):** Curiosity found ancient streambed conglomerate here, the first water-transported gravel identified on Mars. [7] The ground is fairly flat, so it would not exercise the hazard and routing engine much, and it lies far from the Mount Sharp sites.
 - **A full Peace Vallis to Mount Sharp traverse:** Peace Vallis alone is a canyon roughly 18 km long. [8] A trip that long needs a multi-day rover expedition, not a single walking EVA.
 
-### Not yet verified
-- The real distance between a boxwork stop and a Gediz Vallis stop. In the synthetic layout they are about 250 m apart; the real spacing must be measured on a real elevation model, and the two sites may be too far apart for one EVA.
-- Which HiRISE DTM products, if any, cover these sites.
+### What the real data does and doesn't show
+- **Used:** HiRISE DTM `DTEEC_001488_1750_001752_1750_U02`, which a 2014 boxwork study also used. [18, 19]
+- **Not confirmed:** I could not find clear boxwork in the 500 m patch the demo uses, and this DTM does not reach Gediz Vallis as far as I could tell. The demo is "real north Mount Sharp terrain," not a boxwork-to-Gediz traverse.
+- **Not measured:** the real walking distance between a boxwork stop and a Gediz Vallis stop.
 
 ---
 
-## 2. How it works
+## 2. Real terrain data
+
+| Item | Value |
+| :--- | :--- |
+| Product | `DTEEC_001488_1750_001752_1750_U02` ([HiRISE catalog page](https://www.uahirise.org/dtm/PSP_001488_1750)) [18] |
+| Source images | HiRISE PSP_001488_1750 and PSP_001752_1750 |
+| Producer | USGS Astrogeology (project MSL_TRAVERSE_GAP_1) |
+| Format | NASA PDS3 `.IMG`, 32-bit little-endian floats, 360,402,944 bytes |
+| Full grid | 6,736 columns × 13,375 rows, 1.0117 m per pixel |
+| Full area | 4.7206°S–4.9488°S, 137.2390°E–137.3539°E |
+| **Demo patch** | rows 4550–5049, columns 4850–5349 (500 × 500 px, about 506 m × 506 m) |
+| Patch corner (top-left) | 4.7982°S, 137.3217°E |
+| Patch elevation | −4,040.5 m to −3,943.4 m (about 97 m of relief), no missing cells |
+
+**Download it** (about 25 seconds). The file is too big for GitHub, so `realdata/` is in `.gitignore`:
+
+```bash
+mkdir realdata && cd realdata
+B=https://www.uahirise.org/PDS
+curl -o DTEEC_001488_1750_001752_1750_U02.IMG $B/DTM/PSP/ORB_001400_001499/PSP_001488_1750_PSP_001752_1750/DTEEC_001488_1750_001752_1750_U02.IMG
+curl -o README.TXT $B/EXTRAS/DTM/PSP/ORB_001400_001499/PSP_001488_1750_PSP_001752_1750/README.TXT
+cd ..
+```
+
+**How it's read:** `pds_dtm_loader.py` memory-maps the file (`np.memmap`), so only the 500 × 500 patch is loaded, not all 360 MB. It skips the 26,944-byte text label, reads `<f4` floats, turns the "no data" marker (about −3.4 × 10³⁸) into `NaN`, and refuses any patch that is more than half missing data. Pixel positions convert to latitude and longitude with the equirectangular projection values from the file's own label.
+
+**Known artifacts:** the far west strip of this DTM shows stitching seams, so the loader warns about patches there. The HiRISE readme also warns about square "box" artifacts 0.5–1 m off from their surroundings [9]; `--despike-seams` applies a median filter for those.
+
+---
+
+## 3. How it works
 
 ```text
- [ HiRISE DTM GeoTIFF (.tif) ]  OR  [ Synthetic Mount Sharp layout ]
-                          │
-                          ▼
-            terrain_hazard_mapper.py
-            • slope, roughness, rock protrusion
-            • 1-pixel buffer around missing data
-            • 4-tier hazard map + cost grid
-                          │  hazard_layers.npz
-                          ▼
-              martian_eva_router.py
-            • 8-direction A* search
-            • step-to-step slope limit
-            • walking time, energy, walkback distance
-                          │  eva_route.geojson
-                          ▼
-            astronaut_safety_layer.py
-            • time-to-safety map (walking minutes to base)
-            • Apollo walkback check at every route point
-            • timeline, radiation dose, line of sight,
-              sustained-climb rest stops
-                          │  safety_layers.npz + safety_report.json
-                          ▼
-              build_web_viewer.py
-            • one offline HTML map: 5 layers, route,
-              safety overlays, timeline panel, profile
-                          │
-                          ▼
-                  eva_map_viewer.html
+ [ HiRISE DTM .IMG ]                     [ Synthetic Mount Sharp layout ]
+        │                                              │
+ pds_dtm_loader.py + run_mapper_real.py    terrain_hazard_mapper.py (main)
+        │                                              │
+        └──────────────► terrain_hazard_mapper ◄───────┘
+                         • slope, roughness, rock protrusion
+                         • 1-pixel buffer around missing data
+                         • 4-tier hazard map + cost grid
+                                    │  hazard_layers.npz
+                                    ▼
+                         martian_eva_router.py
+                         • 8-direction A* search
+                         • step-to-step slope limit
+                         • walking time, energy, walkback distance
+                                    │  eva_route.geojson
+                                    ▼
+                         astronaut_safety_layer.py
+                         • time-to-safety map, Apollo walkback check
+                         • timeline, radiation, line of sight, rest stops
+                                    │  safety_layers.npz + safety_report.json
+                                    ▼
+                         build_web_viewer.py → eva_map_viewer.html
 ```
 
 The hazard mapper is the **single source of truth**: every later step reads its layers, so the route, the safety checks and the map all describe exactly the same terrain.
@@ -73,35 +98,35 @@ The hazard mapper is the **single source of truth**: every later step reads its 
 ### Files
 | File | What it does |
 | :--- | :--- |
-| `terrain_hazard_mapper.py` | Builds the elevation model (synthetic, or from a GeoTIFF), computes slope, roughness and rock protrusion, classifies hazards, and saves `hazard_layers.npz`. |
-| `martian_eva_router.py` | Loads the hazard layers, plans each leg with A*, checks walkback distance, and exports the route. |
+| `pds_dtm_loader.py` | Reads a patch of the HiRISE PDS3 file, masks missing data, converts pixels to latitude/longitude. |
+| `run_mapper_real.py` | Runs the hazard mapper on the real patch with the true 1.0117 m pixel size. |
+| `terrain_hazard_mapper.py` | Computes slope, roughness and rock protrusion, classifies hazards, saves `hazard_layers.npz`. Its own main builds the synthetic layout. |
+| `martian_eva_router.py` | Plans each leg with A*, checks walkback distance, exports the route. |
 | `astronaut_safety_layer.py` | Builds the time-to-safety map and checks the route against the walkback rule, line of sight and climbing effort. |
-| `build_web_viewer.py` | Packs everything into one interactive, offline HTML page. |
+| `build_web_viewer.py` | Packs everything into one interactive, offline HTML page. The title and badge switch automatically between "HiRISE DTM" and "Synthetic Layout." |
 
 ---
 
-## 3. Hazard classification
+## 4. Hazard classification
 
-Each 1 m grid cell gets three measurements:
+Each grid cell gets three measurements:
 
 1. **Slope (degrees)**, from neighboring elevations (`np.gradient`).
 2. **Roughness (m):** the Terrain Ruggedness Index, the root-mean-square height difference between a cell and its 8 neighbors.
 3. **Rock protrusion index (m):** how far a cell rises above the average of its 8 neighbors. Wide boulders raise the neighboring cells too, so this measures local crest prominence, **not** true rock height.
 
-| Tier | Meaning | Triggered when (assumed thresholds) | Cost multiplier* |
-| :---: | :--- | :--- | :---: |
-| 0 | Nominal | none of the triggers below | 1.0x |
-| 1 | Caution | slope > 10° or roughness > 0.25 m | 1.6x – 2.5x |
-| 2 | High-cost | slope > 15°, roughness > 0.50 m, or protrusion > 0.30 m | 4.4x – 9.8x |
-| 3 | No-go | slope > 22°, roughness > 0.85 m, protrusion > 0.65 m, or within 1 pixel of missing data | blocked |
+| Tier | Meaning | Triggered when (assumed thresholds) |
+| :---: | :--- | :--- |
+| 0 | Nominal | none of the triggers below |
+| 1 | Caution | slope > 10° or roughness > 0.25 m |
+| 2 | High-cost | slope > 15°, roughness > 0.50 m, or protrusion > 0.30 m |
+| 3 | No-go | slope > 22°, roughness > 0.85 m, protrusion > 0.65 m, or within 1 pixel of missing data |
 
-\*Cost ranges measured on the synthetic layout; they depend on the terrain.
-
-**Optional despiking:** setting `despike_hirise_seams=True` applies a 3x3 median filter before analysis. Some HiRISE DTMs contain square areas about 0.5–1 m off from their surroundings [9]; that is close to the roughness limits above, so such artifacts could otherwise appear as false obstacles.
+Passable tiers get a cost multiplier that grows with severity (1.0x for nominal; roughly 1.6–2.5x caution and 4.4–9.8x high-cost on the synthetic layout); no-go cells are blocked.
 
 ---
 
-## 4. Route planning
+## 5. Route planning
 
 - **A\* search, 8 directions.** The heuristic (the estimate of remaining cost) is straight-line grid distance at the cheapest possible rate, so it never overestimates and A* returns the lowest-cost path.
 - **Cost of each step** = surface distance × the destination cell's cost multiplier, plus a penalty per meter of climb.
@@ -110,7 +135,7 @@ Each 1 m grid cell gets three measurements:
 
 ---
 
-## 5. Astronaut safety layer
+## 6. Astronaut safety layer
 
 The safety checks are modeled on how Apollo crews worked on the Moon and on what Curiosity has measured at Gale Crater.
 
@@ -120,7 +145,7 @@ The safety checks are modeled on how Apollo crews worked on the Moon and on what
 - **Knowing where you are counts too.** Without landmarks, the Apollo 14 crew couldn't judge distances. Running short on time and oxygen, they turned back about 30 m from the rim and never knew how close they were. [14]
 
 ### What the layer computes
-1. **Time-to-safety map.** One reverse Dijkstra search, starting at base, records the fastest walking time back to base from every cell on the map, using the same speed curve and step slope limit as the router. It appears in the viewer as the "Time to Safety" layer.
+1. **Time-to-safety map.** One reverse Dijkstra search, starting at base, records the fastest walking time back to base from every cell, using the same speed curve and step slope limit as the router. It appears in the viewer as the "Time to Safety" layer.
 2. **Apollo walkback check at every route point:**
    `time used so far + time back to base + reserve ≤ EVA time budget`
    Points that fail are drawn in red.
@@ -131,27 +156,50 @@ The safety checks are modeled on how Apollo crews worked on the Moon and on what
 
 ---
 
-## 6. Quickstart
+## 7. Quickstart
 
-Requirements: Python 3.10+ and `numpy`. Optional: `matplotlib` (preview images) and `rasterio` (reading GeoTIFFs).
+Requirements: Python 3.10+ and `numpy`. Optional: `matplotlib` for the preview images. The real data needs no extra GIS libraries.
 
 ```bash
 pip install numpy matplotlib
-python3 terrain_hazard_mapper.py    # 1. hazard layers (synthetic layout)
+```
+
+### Real HiRISE terrain (main demo)
+
+Download the DTM first (Section 2), then, in the project folder:
+
+```bash
+python3 run_mapper_real.py          # 1. hazard layers from the real 500 m patch
 python3 martian_eva_router.py       # 2. plan the EVA route
 python3 astronaut_safety_layer.py   # 3. safety checks
 python3 build_web_viewer.py         # 4. interactive map
 ```
 
-Then open `eva_map_viewer.html` in a desktop browser. It works offline; touch panning also works on tablets.
+Open `eva_map_viewer.html` in a desktop browser. It works offline; touch panning also works on tablets.
 
-To use real data, replace `build_synthetic_mount_sharp()` in the mapper's main block with `build_from_geotiff("<your_DTM>.tif")`. Waypoints are set in the router's main block as grid row and column numbers; the first waypoint is treated as base. Safety assumptions can be changed with command-line options, for example `python3 astronaut_safety_layer.py --eva-budget-min 90 --reserve-min 30`.
+To try another patch: `python3 run_mapper_real.py --row 8550 --col 3350`. You'll also need new waypoints for it.
+
+### Synthetic layout (test terrain)
+
+Run `python3 terrain_hazard_mapper.py` instead of step 1. The router's main block currently holds the **real-patch** waypoints, so swap in the synthetic ones first: Base (row 45, col 60), Boxwork Vein Node (195, 180), Gediz Sulfur Rim (255, 298), Base again.
+
+### Waypoints on the real patch
+
+Row and column are positions inside the 500 × 500 patch. Each was chosen as the flattest tier-0 spot in the patch's largest connected walkable area, which covers 81% of it.
+
+| Waypoint | Row | Col |
+| :--- | ---: | ---: |
+| HAB / Base | 169 | 361 |
+| Stop A (center) | 319 | 224 |
+| Stop B (southeast) | 393 | 449 |
+
+Safety assumptions can be changed from the command line, for example `python3 astronaut_safety_layer.py --eva-budget-min 90 --reserve-min 30`.
 
 ### Outputs
 | File | Contents |
 | :--- | :--- |
 | `hazard_layers.npz` | Elevation, slope, roughness, rock protrusion, hazard tier, cost grid and no-go mask |
-| `hazard_manifest.json` | Grid size, elevation range, tier coverage and all threshold assumptions |
+| `hazard_manifest.json` | Source, grid size, elevation range, tier coverage and all threshold assumptions |
 | `terrain_hazard_map.png` | Shaded relief, slope, and 4-tier hazard map |
 | `eva_route.geojson` | Each leg as a 3D line with distance, slope, time and energy |
 | `eva_route_preview.png` | The route drawn on the hazard map |
@@ -159,39 +207,53 @@ To use real data, replace `build_synthetic_mount_sharp()` in the mapper's main b
 | `safety_report.json` | Timeline, walkback result, radiation, shelter time, line of sight, rest stops |
 | `astronaut_safety_preview.png` | Time-to-safety map with route safety flags |
 | `eva_map_viewer.html` | The interactive map |
-| `*.log` | Run logs |
 
 ---
 
-## 7. Demo results (synthetic layout)
+## 8. Results
 
-Mission: Base → Boxwork stop → Gediz rim stop → Base, on the synthetic 350 m × 450 m layout.
+### Real HiRISE patch (north Mount Sharp)
 
-| Leg | Distance | Time | Steepest step | Steps over 20° |
+Mission: Base → Stop A → Stop B → Base. Hazard map: 49% nominal, 19% caution, 15% high-cost, 17% no-go.
+
+| Leg | Distance | Climb | Max slope | Time |
 | :--- | ---: | ---: | ---: | ---: |
-| Base → Boxwork | 280 m | 8.3 min | 21.5° | 3 (3.2 m) |
-| Boxwork → Gediz rim | 151 m | 4.1 min | 20.2° | 1 (1.1 m) |
-| Gediz rim → Base | 412 m | 10.3 min | 21.9° | 3 (3.7 m) |
-| **Total** | **843 m** | **22.7 min** | | |
+| Base → Stop A | 224.0 m | +21.9 m | 17.1° | 7.4 min |
+| Stop A → Stop B | 418.6 m | +9.9 m | 16.1° | 11.2 min |
+| Stop B → Base | 270.4 m | +2.1 m | 9.9° | 6.3 min |
+| **Total** | **913.1 m** | | | **24.9 min** |
 
 | Safety check | Result |
 | :--- | :--- |
-| Walkback rule (60 min budget, 30 min reserve) | Pass at all 720 route points; smallest margin 7.3 min |
-| Worst-case time to shelter | 9.0 min (at the Gediz rim) |
-| Radiation dose for the walk | 0.011 mSv |
-| Line of sight to base | 99.7% of route points |
-| Sustained-climb rest stops | 0 (no stretch climbs 5 m within 50 m) |
-| EVA window | 12:00–12:23 LMST, walking time only |
+| Walkback rule (60 min budget, 30 min reserve) | Pass at every route point; smallest margin 5.1 min |
+| Worst-case time to shelter | 6.2 min (at Stop B) |
+| Radiation dose for the walk | 0.012 mSv |
+| Line of sight to base | 64.8% of route points |
+| Sustained-climb rest stops | 2 (largest climb +16.3 m) |
+| Steps over 20° | 0 |
 
-- No route cell falls on a no-go cell.
-- Hazard map coverage: 68% nominal, 8% caution, 9% high-cost, 15% no-go.
-- The time to shelter from the Gediz rim (9.0 min) is shorter than the planned return leg (10.3 min). That is expected: the safety map finds the *fastest* walk home, while the router plans the *safest* route, which avoids high-cost ground.
+### Synthetic layout
 
-These numbers describe the synthetic layout only, not real Mars terrain.
+Mission: Base → Boxwork stop → Gediz rim stop → Base. Hazard map: 68% nominal, 8% caution, 9% high-cost, 15% no-go.
+
+| Leg | Distance | Time | Steps over 20° |
+| :--- | ---: | ---: | ---: |
+| Base → Boxwork | 280 m | 8.3 min | 3 |
+| Boxwork → Gediz rim | 151 m | 4.1 min | 1 |
+| Gediz rim → Base | 412 m | 10.3 min | 3 |
+| **Total** | **843 m** | **22.7 min** | |
+
+Walkback pass (smallest margin 7.3 min), worst time to shelter 9.0 min, line of sight 99.7%, 0 rest stops.
+
+### What the comparison shows
+
+Real Mars is rougher than my synthetic version: 49% safe ground versus 68%. On the real patch, 35% of the walk is out of sight of base and 2 rest stops show up, where the synthetic layout had almost none. That's the safety layer doing its job on actual terrain.
+
+One more thing to know: time to shelter can be shorter than the planned walk home. The safety map finds the *fastest* way back, while the router plans the *safest* route, which avoids high-cost ground.
 
 ---
 
-## 8. Assumptions and limitations
+## 9. Assumptions and limitations
 
 All of these are planning assumptions, not measured values:
 
@@ -202,13 +264,13 @@ All of these are planning assumptions, not measured values:
 - **Energy model:** level walking cost (2.8 J per kg per m) plus uphill climb work using Mars gravity (3.721 m/s²) at 25% muscle efficiency. Downhill counts as zero extra effort, so return legs show less energy than they would in reality.
 - **Radiation:** 0.67 mSv/day is a 2012–2013 average and varies with the solar cycle. Shielding by terrain or the suit is not modeled.
 - **Line of sight** is geometric only; it does not model radio range.
-- **Science value is chosen by hand.** Stops are picked from published Curiosity findings, not calculated from data.
+- **Waypoints on the real patch** were chosen for safe, flat ground, not for science value. Stops on the synthetic layout were picked by hand from published Curiosity findings.
+- **DTM accuracy:** HiRISE DTMs can contain artifacts [9]; the demo patch was not despiked.
 - **Not modeled:** dust storms, wind, or how temperature changes along the route.
-- **Short steep steps:** routes may use a few steps between 20° and 22° to pass through gaps between ridges instead of making long detours.
 
 ---
 
-## 9. Sources
+## 10. Sources
 
 1. Space.com, "Curiosity rover finds clues to Mars' watery past in rocky 'spiderwebs.'" https://www.space.com/space-exploration/mars-rovers/curiosity-rover-finds-clues-to-mars-watery-past-in-rocky-spiderwebs
 2. NASA, "NASA's Curiosity Mars Rover Starts Unpacking Boxwork Formations." https://www.nasa.gov/missions/mars-science-laboratory/curiosity-rover/nasas-curiosity-mars-rover-starts-unpacking-boxwork-formations
@@ -227,12 +289,17 @@ All of these are planning assumptions, not measured values:
 15. ScienceDaily / Southwest Research Institute, "First radiation measurements from the surface of Mars" (Dec 9, 2013). https://www.sciencedaily.com/releases/2013/12/131209181133.htm
 16. redOrbit, "Mars Surface Radiation Levels Almost Suitable For Manned Mission." https://www.redorbit.com/news/space/1113024596/mars-surface-radiation-almost-suitable-for-manned-mission-121013
 17. NASA, "Steady Temperatures at Mars' Gale Crater." https://science.nasa.gov/resource/steady-temperatures-at-mars-gale-crater
+18. University of Arizona HiRISE, DTM "Edge along Gale Crater Interior Mound" (DTEEC_001488_1750_001752_1750_U02). https://www.uahirise.org/dtm/PSP_001488_1750
+19. Siebach et al. (2014), "Volumetric estimates of ancient water on Mount Sharp based on boxwork deposits, Gale Crater, Mars," Journal of Geophysical Research: Planets. https://agupubs.onlinelibrary.wiley.com/doi/10.1002/2013JE004508
 
-HiRISE DTM background: NASA PDS Orbital Data Explorer, "MRO HiRISE Digital Terrain Model (DTM)." https://ode.rsl.wustl.edu/mars/pagehelp/Content/Missions_Instruments/Mars%20Reconnaissance%20Orbiter/HiRISE/HiRISE%20DTM.htm
+**Data credit:** HiRISE images NASA/JPL/University of Arizona; DTM produced by USGS Astrogeology.
 
 ---
 
-## 10. Disclosures
+## 11. Disclosures
 
 - Background research on Mars terrain was done before the event; all code in this repository was written during the event.
-- *(Add any disclosure the Space Apps submission guide requires, such as use of AI assistants.)*
+- **AI assistance.** I built this project solo with heavy help from AI assistants, and I want to be upfront about how:
+    - **Claude (Anthropic)** helped me plan the weekend, scope the MVP, and research the science and Apollo sources. It reviewed and tested my code by running it, found bugs, and wrote fixes (the map viewer's label sizing, zoom and touch panning, the loader's logging and missing-data check, and the data-driven map title). It also found and downloaded the HiRISE DTM, picked the 500 m patch and the waypoints, and drafted most of this README.
+    - **A second AI assistant** generated much of the Python code from my descriptions and requirements, including the hazard mapper, router, safety layer and viewer.
+    - **My part:** I chose the challenge, the science targets and the safety ideas to model, made the design calls, directed every change, compared the two assistants' advice against each other, and decided what to keep. Every number in the Results section comes from running the code, not from an AI's guess.
